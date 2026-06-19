@@ -25,8 +25,8 @@ Capability-gated:
 - Prompt logprobs are opt-in with `extract.logprobs.include_prompt=true` when the active vLLM `SamplingParams` supports `prompt_logprobs`.
 - Raw logits are unsupported because the public vLLM generation output exposes logprobs, not logits.
 - Exact entropy is unsupported unless a future runtime path exposes the complete distribution. Approximate entropy can be explicitly requested from renormalized top-k logprobs.
-- Final-layer token hidden states are conditionally supported for models whose vLLM configuration advertises the `pooling` runner. wllm runs the completed token sequence through an isolated vLLM pooling runner with `ALL` pooling and records the capture site as `final_hidden_state_pooling_runner`.
-- Intermediate transformer-block hidden states remain unsupported in the production runtime until a request-aware public vLLM tap is available. The server does not use global hooks that could misattribute batched requests.
+- Selected transformer-block token hidden states are conditionally supported for models whose vLLM configuration advertises the `pooling` runner and runs with `tensor_parallel_size=1`. wllm runs the completed token sequence through an isolated vLLM pooling runner with temporary scoped hooks and records the capture site as `transformer_block_output`.
+- Tensor-parallel hidden-state capture remains unsupported until aggregation of sharded intermediate activations is implemented. The normal serving runner never receives hooks.
 - Attention weights are reported unsupported when the active vLLM path or fused attention backend does not expose them.
 
 Performance posture:
@@ -53,7 +53,7 @@ pip install -e '.[vllm]'
 
 Supported Python: 3.10 or newer.
 
-Tested vLLM compatibility range in the compatibility module: `>=0.8,<0.10`.
+Validated vLLM version: `0.10.2`. The production `vllm` extra installs `vllm==0.10.2`, and the runtime rejects other vLLM versions with a structured `503` instead of guessing private API paths.
 
 ## Layout
 
@@ -167,7 +167,7 @@ curl http://localhost:8000/v1/traces \
 
 `GET /v1/extraction-schema` returns `wllm.extraction.v1`, the live Pydantic JSON schema for extraction requests, selector semantics, configured resource limits, and runtime capabilities.
 When vLLM exposes or configures an attention backend, capability metadata includes `attention_backend` and echoes it in the attention capability details.
-Hidden-state capability metadata reports whether the loaded model advertises a vLLM `pooling` runner. Without that runner, hidden-state extraction returns `hidden_states_unavailable`.
+Hidden-state capability metadata reports whether the loaded model advertises a vLLM `pooling` runner and whether the worker configuration is single-rank. Without that runner, with tensor parallelism enabled, with `gpu_memory_utilization > 0.5`, or without runtime `hidden_size` metadata for capture-size enforcement, hidden-state extraction returns `hidden_states_unavailable`.
 
 ## Trace Schema
 
@@ -179,7 +179,7 @@ Trace responses use `wllm.trace.v1` and include:
 - `trace.logprobs`: per-token selected `token_id`/`token`/`logprob` fields and top-k alternatives for generated tokens, plus prompt-token rows when `include_prompt=true`.
 - `trace.hidden_states` and `trace.attentions`: tensor records when supported by the active runtime.
 - `trace_manifest`: persisted JSON trace-bundle manifest for `/v1/traces`.
-- `artifacts`: artifact manifests with byte size, SHA-256, tensor names, shapes, dtypes, and trace ID.
+- `artifacts`: artifact manifests with byte size, SHA-256, tensor names, shapes, capture dtypes, storage dtypes, and trace ID.
 - `metadata`: sampling, resolved selectors, capabilities, and timing fields.
 
 When model topology is available from vLLM, layer and head selectors are validated against it before extraction proceeds. Trace metadata records resolved selectors for tensor requests, including normalized layer indexes, token positions, and pooling metadata.
@@ -194,7 +194,7 @@ Attention key positions additionally support `previous_token`, which maps each v
 
 Hidden-state pooling metadata supports `null`, `mean`, `max`, and `last`.
 
-In the current vLLM runtime, hidden-state tensor values are available only for the final layer via the isolated pooling runner. Requests for selectors such as `middle`, `middle_third`, or any non-final layer return `unsupported_extraction` with `hidden_state_layer_unavailable`.
+In the current vLLM runtime, hidden-state tensor values are captured from selected transformer-block modules on an isolated pooling runner. This is post-generation hidden-state replay over the exact prompt token IDs plus generated token IDs reported by vLLM, not online capture from the original autoregressive generation forwards. This path is opt-in per extraction request, guarded by a per-runner lock, and currently limited to `tensor_parallel_size=1`. For validated vLLM 0.10.2, the isolated pooling runner is initialized with eager execution and in-process V1 engine mode so scoped module hooks observe real forward outputs; the normal generation runner keeps its standard vLLM execution path.
 
 ## Resource Limits
 
@@ -213,9 +213,11 @@ Requests above configured limits return `413` with an OpenAI-style error envelop
 
 Inline token-id and logprob numeric payloads are checked against `max_inline_tensor_bytes`. Reduce `max_tokens` or `extract.logprobs.top_k` when inline extraction exceeds this limit.
 
-Large tensor requests require three things: an artifact request that includes the tensor family, `extract.artifacts.allow_large=true`, and server-side `large_extraction_enabled=true`. Full hidden-state or attention dumps are rejected unless they are artifact-backed and pass the hard byte limits. The default server configuration keeps large extraction disabled.
+Large tensor requests require three things: an artifact request that includes the tensor family, `extract.artifacts.allow_large=true`, and server-side `large_extraction_enabled=true`. Full hidden-state or attention dumps are rejected unless they are artifact-backed and pass the hard byte limits. Hidden-state capture is also checked against `max_total_captured_tensor_bytes` before the pooling runner starts, using the raw captured shape `requested_layers * total_tokens * hidden_size * dtype_bytes`, because the runtime captures the full completed token sequence before applying requested position selectors. The default server configuration keeps large extraction disabled.
 
 Logprob artifacts require `extract.logprobs`; artifact inclusion alone does not silently request extra vLLM outputs.
+
+When a captured tensor dtype cannot be represented by the selected storage format, wllm converts explicitly and records both the original capture dtype and the stored dtype. For example, bfloat16 hidden states stored as JSON or NPZ are converted to float32 values with `capture_dtype="torch.bfloat16"` and `storage_dtype="float32"` metadata.
 
 ## Capability Errors
 
@@ -237,7 +239,11 @@ The runtime never returns placeholder tensors or synthetic internals.
 
 If the active vLLM `SamplingParams` does not expose `logprobs` or `prompt_logprobs`, extraction requests for those outputs return `unsupported_extraction` with `token_logprobs_unavailable` or `prompt_logprobs_unavailable`. Ordinary OpenAI sampling fields that the active vLLM version does not support remain `422` validation errors.
 
-If the model does not support vLLM's pooling runner, final-layer hidden-state requests return `unsupported_extraction` with `hidden_states_unavailable`. If the model supports pooling but the request asks for non-final layers, the runtime returns `hidden_state_layer_unavailable` with the supported final layer in `details`.
+If the model does not support vLLM's pooling runner, or if tensor parallelism is enabled, hidden-state requests return `unsupported_extraction` with `hidden_states_unavailable` and capability details explaining the unavailable condition.
+
+## vLLM Compatibility Notes
+
+The standard generation path uses vLLM `LLM.generate` and `SamplingParams`. Hidden-state extraction uses isolated compatibility code in `runtime/vllm_compat.py`: vLLM `LLM.encode`, the pooling model conversion path, and scoped `apply_model`/model-executor access for temporary hooks. This private surface is version-guarded to vLLM 0.10.2 and tested with vLLM 0.10.2 in the reference integration environment.
 
 ## Research Adapters
 
@@ -289,4 +295,4 @@ Integration tests are gated:
 WLLM_TEST_MODEL=/path/to/local/model pytest -m integration
 ```
 
-The integration suite is skipped unless vLLM is installed and `WLLM_TEST_MODEL` points to a local model. It includes a token/logprob smoke test and a final-layer hidden-state smoke test. Use a reference model whose vLLM configuration supports the `pooling` runner for the hidden-state test. Intermediate-layer hidden states and attention coverage remain capability-gated until vLLM exposes request-aware tensors for those paths.
+The integration suite is skipped unless vLLM is installed and `WLLM_TEST_MODEL` points to a local model. It includes a token/logprob smoke test and a hidden-state smoke test using a selected middle layer. The validated reference run used vLLM 0.10.2, PyTorch 2.8 CUDA wheels, Qwen/Qwen3-0.6B from a local Hugging Face cache, `WLLM_TEST_MAX_MODEL_LEN=1024`, and `WLLM_TEST_GPU_MEMORY_UTILIZATION=0.35`. Use a reference model whose vLLM configuration supports the `pooling` runner and `tensor_parallel_size=1` for the hidden-state test. Attention coverage remains capability-gated until the active backend exposes weights.

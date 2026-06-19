@@ -1,0 +1,39 @@
+# Runtime artifacts
+wllm-artifacts/
+wllm-stress-artifacts/
+
+# Local benchmark harness and generated reports
+scripts/stress_wllm_vs_vllm.py
+reports/*stress*.json
+reports/*stress*.md
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+uv.lock
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
