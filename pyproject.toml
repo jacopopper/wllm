@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "w-llm"
+version = "0.1.0"
+description = "White-box LLM serving layer on top of vLLM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "w-llm contributors" }]
+dependencies = [
+  "fastapi>=0.115",
+  "numpy>=1.26",
+  "pydantic>=2.7",
+  "uvicorn[standard]>=0.30",
+  "vllm>=0.8",
+]
+
+[project.optional-dependencies]
+actmap = ["torch>=2.3"]
+debug-transformers = ["accelerate>=0.31", "transformers>=4.43", "torch>=2.3"]
+test = ["httpx>=0.27", "pytest>=8.2"]
+
+[project.scripts]
+wllm = "wllm.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wllm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
