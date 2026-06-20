@@ -60,6 +60,7 @@ class VLLMRuntime:
         self._attention_backend: str | None = None
         self._supported_runner_types: list[str] | None = None
         self._pooling_llm: Any | None = None
+        self._prewarm_initializing = False
         self._load_lock = threading.RLock()
         self._pooling_lock = threading.RLock()
 
@@ -88,11 +89,11 @@ class VLLMRuntime:
                     "max_model_len": self.config.max_model_len,
                     "tokenizer": self.config.tokenizer,
                     "trust_remote_code": self.config.trust_remote_code,
-                    "enforce_eager": True if self.config.enable_online_hidden_states else None,
-                    "enable_prefix_caching": False if self.config.enable_online_hidden_states else None,
+                    "enforce_eager": True if self._uses_eager_generation_runner else None,
+                    "enable_prefix_caching": False if self._uses_eager_generation_runner else None,
                 },
             )
-            env_overrides = {"VLLM_ENABLE_V1_MULTIPROCESSING": "0"} if self.config.enable_online_hidden_states else {}
+            env_overrides = {"VLLM_ENABLE_V1_MULTIPROCESSING": "0"} if self._uses_eager_generation_runner else {}
             try:
                 with _temporary_environment(env_overrides):
                     llm = imports.LLM(**kwargs)
@@ -109,7 +110,7 @@ class VLLMRuntime:
                     online_hidden_states=self.config.enable_online_hidden_states,
                 )
             except Exception as exc:
-                details = {"exception": repr(exc), "model": self.config.model}
+                details: dict[str, Any] = {"exception": repr(exc), "model": self.config.model}
                 if env_overrides:
                     details.update(env_overrides)
                 if self.config.local_files_only:
@@ -145,10 +146,23 @@ class VLLMRuntime:
     def topology(self) -> RuntimeTopology | None:
         return self._topology
 
+    def _require_llm(self) -> Any:
+        if self._llm is None:
+            raise AssertionError("vLLM runtime is not loaded")
+        return self._llm
+
+    @property
+    def _uses_eager_generation_runner(self) -> bool:
+        return self.config.enable_online_hidden_states or self._prewarm_initializing
+
     def prewarm_hidden_states(self) -> None:
         """Initialize the optional hidden-state extraction runner before serving requests."""
 
-        self._ensure_loaded()
+        self._prewarm_initializing = True
+        try:
+            self._ensure_loaded()
+        finally:
+            self._prewarm_initializing = False
         self._ensure_replay_hidden_state_runtime_available(self._topology)
         with self._pooling_lock:
             self._ensure_pooling_llm()
@@ -199,6 +213,7 @@ class VLLMRuntime:
             self._collector_registry = collector_registry
         with collector_registry.scope(request_id):
             self._ensure_loaded()
+            llm = self._require_llm()
             orchestrator = ExtractionOrchestrator(self.capabilities())
             topology = self.topology()
             orchestrator.preflight(request, limits, topology=topology)
@@ -212,6 +227,7 @@ class VLLMRuntime:
             if capture_mode == "online":
                 requested_layers = self._resolve_hidden_state_layers(request, topology)
                 self._ensure_online_hidden_state_runtime_available(topology)
+                assert topology is not None
                 prompt_token_count = self._tokenized_prompt_length(prompt)
                 self._check_hidden_capture_size_for_shape(
                     request,
@@ -225,9 +241,9 @@ class VLLMRuntime:
                     limits=limits,
                 )
                 online_capture = capture_online_hidden_states(
-                    self._llm,
+                    llm,
                     layers=requested_layers,
-                    generate=lambda: self._llm.generate([prompt], sampling),
+                    generate=lambda: llm.generate([prompt], sampling),
                     capture_max_position=self._online_hidden_capture_max_prefix_position(
                         request,
                         prompt_token_count=prompt_token_count,
@@ -235,7 +251,7 @@ class VLLMRuntime:
                 )
                 outputs = online_capture.output
             else:
-                outputs = self._llm.generate([prompt], sampling)
+                outputs = llm.generate([prompt], sampling)
             generation_ms = (time.perf_counter() - started) * 1000.0
             output = outputs[0]
             completion = output.outputs[0]
@@ -491,22 +507,36 @@ class VLLMRuntime:
         return max_position if max_position >= 0 else None
 
     def _tokenized_prompt_length(self, prompt: str) -> int | None:
-        tokenizer = self._llm.get_tokenizer()
+        tokenizer = self._require_llm().get_tokenizer()
         encode = getattr(tokenizer, "encode", None)
         if callable(encode):
+            lengths = []
             try:
-                return len(encode(prompt, add_special_tokens=False))
+                lengths.append(len(encode(prompt, add_special_tokens=False)))
+            except TypeError:
+                pass
+            except Exception:
+                pass
+            try:
+                lengths.append(len(encode(prompt, add_special_tokens=True)))
             except TypeError:
                 try:
-                    return len(encode(prompt))
+                    lengths.append(len(encode(prompt)))
                 except Exception:
-                    return None
+                    pass
             except Exception:
-                return None
+                pass
+            if lengths:
+                return max(lengths)
         tokenize = getattr(tokenizer, "__call__", None)
         if callable(tokenize):
             try:
-                encoded = tokenize(prompt)
+                encoded = tokenize(prompt, add_special_tokens=True)
+            except TypeError:
+                try:
+                    encoded = tokenize(prompt)
+                except Exception:
+                    return None
             except Exception:
                 return None
             input_ids = getattr(encoded, "input_ids", None)
@@ -598,14 +628,14 @@ class VLLMRuntime:
         return self._pooling_llm
 
     def _render_chat(self, request: ChatCompletionRequest) -> str:
-        tokenizer = self._llm.get_tokenizer()
+        tokenizer = self._require_llm().get_tokenizer()
         messages = [message.model_dump() for message in request.messages]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     def _render_extract_prompt(self, request: ExtractRequest) -> str:
         if request.prompt is not None:
             return request.prompt
-        tokenizer = self._llm.get_tokenizer()
+        tokenizer = self._require_llm().get_tokenizer()
         messages = [message.model_dump() for message in request.messages or []]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -698,7 +728,7 @@ class VLLMRuntime:
     def _generate_openai_response(self, request: Any, prompts: list[str], *, chat: bool) -> dict[str, Any]:
         sampling = self._sampling_params(request)
         created = int(time.time())
-        outputs = self._llm.generate(prompts, sampling)
+        outputs = self._require_llm().generate(prompts, sampling)
         choices = []
         prompt_tokens = 0
         completion_tokens = 0
@@ -763,7 +793,7 @@ class VLLMRuntime:
     def _decode_tokens(self, token_ids: list[int]) -> list[str]:
         if not token_ids:
             return []
-        tokenizer = self._llm.get_tokenizer()
+        tokenizer = self._require_llm().get_tokenizer()
         batch_decode = getattr(tokenizer, "batch_decode", None)
         if callable(batch_decode):
             try:
@@ -821,9 +851,9 @@ class VLLMRuntime:
         entries = getattr(completion, "logprobs", None)
         if not entries:
             return None
-        tokens = []
-        token_logprobs = []
-        top_logprobs = []
+        tokens: list[str | None] = []
+        token_logprobs: list[float | None] = []
+        top_logprobs: list[dict[str, float]] = []
         for entry in entries:
             if not entry:
                 tokens.append(None)

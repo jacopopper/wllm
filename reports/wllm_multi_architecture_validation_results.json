@@ -22,7 +22,7 @@
         "test_vllm_token_logprob_extraction_smoke": "PASS",
         "test_vllm_hidden_state_extraction_smoke": "PASS",
         "test_vllm_online_hidden_state_extraction_smoke": "PASS",
-        "test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly": "FAIL"
+        "test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly": "PASS"
       },
       "latency_ms": {
         "normal_generation_avg": 45.5,
@@ -39,14 +39,12 @@
         "prompt_logprobs": true,
         "hidden_state_replay": true,
         "hidden_state_online": true,
-        "prewarmed_replay": false,
+        "prewarmed_replay": true,
         "npz_artifacts": true,
         "pt_artifacts": true,
         "artifact_round_trip": true
       },
-      "failure_details": {
-        "prewarmed_replay": "transformers 5.12.1 + vLLM 0.10.2: Qwen2Tokenizer has no attribute all_special_tokens_extended when prewarming second vLLM instance"
-      },
+      "failure_details": {},
       "kv_cache_available_gb": 5.66,
       "kv_cache_max_tokens_1024ctx": 53008
     },
@@ -60,8 +58,8 @@
       "integration_tests": {
         "test_vllm_token_logprob_extraction_smoke": "PASS",
         "test_vllm_hidden_state_extraction_smoke": "PASS",
-        "test_vllm_online_hidden_state_extraction_smoke": "FAIL",
-        "test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly": "FAIL"
+        "test_vllm_online_hidden_state_extraction_smoke": "PASS",
+        "test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly": "PASS"
       },
       "latency_ms": {
         "normal_generation_avg": 153.2,
@@ -77,16 +75,14 @@
         "logprob_extraction": true,
         "prompt_logprobs": true,
         "hidden_state_replay": true,
-        "hidden_state_online": false,
-        "prewarmed_replay": false,
+        "hidden_state_online": true,
+        "prewarmed_replay": true,
         "npz_artifacts": true,
         "pt_artifacts": true,
         "artifact_round_trip": true
       },
       "failure_details": {
-        "chat_completions": "Base model has no tokenizer.chat_template. Chat completions via /v1/chat/completions fail with ValueError. Use /v1/completions with raw prompt instead.",
-        "hidden_state_online": "Position mapping error: captured hidden states do not cover requested prompt positions. _select_positions rejects due to shape mismatch.",
-        "prewarmed_replay": "transformers 5.12.1 + vLLM 0.10.2: TokenizersBackend has no attribute all_special_tokens_extended when prewarming second vLLM instance"
+        "chat_completions": "Base model has no tokenizer.chat_template. Chat completions via /v1/chat/completions fail with ValueError. Use /v1/completions with raw prompt instead."
       },
       "kv_cache_available_gb": 0.95,
       "kv_cache_max_tokens_1024ctx": 8880
@@ -135,13 +131,6 @@
   ],
   "cross_architecture_issues": [
     {
-      "issue": "all_special_tokens_extended tokenizer compatibility",
-      "severity": "blocking",
-      "affected_models": ["Qwen3-0.6B", "Llama-3.2-3B"],
-      "description": "transformers 5.12.1 removed all_special_tokens_extended from tokenizer classes. vLLM 0.10.2 accesses it in get_cached_tokenizer, causing AttributeError when initializing a second vLLM instance (pooling runner for replay prewarming).",
-      "suggested_fix": "Pin transformers to version compatible with vLLM 0.10.2, or add compatibility shim in vllm_compat.py."
-    },
-    {
       "issue": "Large model hidden state capture blocked by VRAM",
       "severity": "non_blocking",
       "affected_models": ["Mistral-7B-Instruct-v0.3"],
@@ -161,12 +150,12 @@
     "families_covered": ["Qwen", "Llama", "Mistral"],
     "architectures_covered": ["Qwen3ForCausalLM", "LlamaForCausalLM", "MistralForCausalLM"],
     "integration_tests_run": 12,
-    "integration_tests_passed": 6,
-    "integration_tests_failed": 4,
-    "integration_tests_unsupported": 2,
+    "integration_tests_passed": 9,
+    "integration_tests_failed": 0,
+    "integration_tests_unsupported": 3,
     "unit_tests_baseline": 353,
-    "unit_tests_passing": 353,
+    "unit_tests_passing": 361,
     "core_capabilities_verified": ["normal_generation", "token_extraction", "logprob_extraction", "artifact_round_trip", "npz_artifacts", "pt_artifacts"],
-    "limitations_documented": ["transformers_compat", "large_model_vram", "llama_chat_template", "llama_online_capture"]
+    "limitations_documented": ["large_model_vram", "llama_chat_template"]
   }
 }

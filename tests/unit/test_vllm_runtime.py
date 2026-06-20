@@ -69,6 +69,15 @@ class EncodingFakeTokenizer(FakeTokenizer):
         return [1]
 
 
+class BosEncodingFakeTokenizer(FakeTokenizer):
+    @staticmethod
+    def encode(prompt: str, **kwargs: Any) -> list[int]:
+        del prompt
+        if kwargs.get("add_special_tokens") is False:
+            return [101]
+        return [1, 101]
+
+
 class RestrictedSamplingParams:
     def __init__(self, max_tokens: int, temperature: float = 1.0) -> None:
         self.kwargs = {"max_tokens": max_tokens, "temperature": temperature}
@@ -97,6 +106,12 @@ class FakeCompletion:
 class FakeOutput:
     prompt_token_ids = [1]
     prompt_logprobs = [{1: -0.4}]
+    outputs = [FakeCompletion()]
+
+
+class BosPromptOutput:
+    prompt_token_ids = [1, 101]
+    prompt_logprobs = [{1: -0.1}, {101: -0.2}]
     outputs = [FakeCompletion()]
 
 
@@ -189,6 +204,18 @@ class FakeOnlineLLM(FakeLLM):
 class EncodingFakeOnlineLLM(FakeOnlineLLM):
     def get_tokenizer(self) -> EncodingFakeTokenizer:
         return EncodingFakeTokenizer()
+
+
+class BosEncodingFakeOnlineLLM(FakeOnlineLLM):
+    def get_tokenizer(self) -> BosEncodingFakeTokenizer:
+        return BosEncodingFakeTokenizer()
+
+    def generate(self, prompts: list[str], sampling: FakeSamplingParams) -> list[BosPromptOutput]:
+        del prompts, sampling
+        self.generate_calls += 1
+        for layer in self.model.model.layers:
+            layer.emit(2)
+        return [BosPromptOutput()]
 
 
 class GenerateFailsOnlineLLM(FakeOnlineLLM):
@@ -546,6 +573,34 @@ def test_online_hidden_state_config_uses_eager_inprocess_generation_runner(monke
     assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "1"
     assert runtime.capabilities().hidden_states.details["online_hidden_states_enabled"] is True
     assert "online" in runtime.capabilities().hidden_states.details["capture_modes"]
+
+
+def test_prewarm_generation_runner_uses_eager_inprocess_for_tokenizer_compat(monkeypatch) -> None:
+    class LoadableLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.env_during_init = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+
+    class Imports:
+        module = object()
+        version = "0.10.2"
+        LLM = LoadableLLM
+        SamplingParams = FakeSamplingParams
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    monkeypatch.setattr(vllm_runtime_module, "import_vllm", lambda: Imports())
+    runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake"))
+
+    runtime._prewarm_initializing = True
+    try:
+        runtime._ensure_loaded()
+    finally:
+        runtime._prewarm_initializing = False
+
+    assert runtime._llm.kwargs["enforce_eager"] is True
+    assert runtime._llm.kwargs["enable_prefix_caching"] is False
+    assert runtime._llm.env_during_init == "0"
+    assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "1"
 
 
 def test_failed_initialization_metadata_does_not_publish_partial_llm(monkeypatch) -> None:
@@ -1399,6 +1454,45 @@ def test_generate_extract_slices_online_prompt_capture_prefix(tmp_path) -> None:
         "captured_source_positions": [0, 0],
     }
     assert all(not layer.hooks for layer in runtime._llm.model.model.layers)
+
+
+def test_generate_extract_online_prompt_capture_counts_special_tokens(tmp_path) -> None:
+    from artifacts.store import ArtifactStore
+    from extractors.planning import ResourceLimits
+
+    runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake", enable_online_hidden_states=True))
+    runtime._imports = FakeOnlineImports()
+    runtime._llm = BosEncodingFakeOnlineLLM()
+    runtime._topology = RuntimeTopology(num_layers=12, num_attention_heads=8, hidden_size=32)
+    runtime._supported_runner_types = ["generate"]
+
+    trace = runtime.generate_extract(
+        ExtractRequest.model_validate(
+            {
+                "model": "fake",
+                "prompt": "hello",
+                "extract": {
+                    "hidden_states": [
+                        {"layers": 5, "positions": "prompt", "capture_mode": "online"}
+                    ]
+                },
+            }
+        ),
+        limits=ResourceLimits(),
+        artifact_store=ArtifactStore(tmp_path),
+        persist=False,
+    )
+
+    record = trace.trace.hidden_states[0]
+    assert trace.generation["usage"]["prompt_tokens"] == 2
+    assert record.positions == [0, 1]
+    assert record.shape == [1, 2, 32]
+    assert record.capture_metadata["layer_chunk_shapes"]["5"] == [[2, 32]]
+    assert record.capture_metadata["capture_filter"] == {
+        "type": "dense_prefix",
+        "max_source_position": 1,
+        "captured_source_positions": [0, 1],
+    }
 
 
 def test_generate_extract_uses_modern_pooling_runner_for_hidden_states(tmp_path, monkeypatch) -> None:

@@ -257,7 +257,7 @@ def _apply_transformers_compat() -> None:
             def _get_all_special_tokens_extended(self):  # type: ignore[no-untyped-def]
                 return self.all_special_tokens
 
-            PreTrainedTokenizerBase.all_special_tokens_extended = property(
+            PreTrainedTokenizerBase.all_special_tokens_extended = property(  # type: ignore[attr-defined]
                 _get_all_special_tokens_extended
             )
     except Exception:
@@ -837,7 +837,12 @@ def _install_hidden_state_hooks(
     invalid = [layer for layer in layers if layer < 0 or layer >= len(modules)]
     if invalid:
         return {"error": "layer_index_out_of_range", "invalid_layers": invalid, "num_layers": len(modules)}
-    state = {"captures": {}, "handles": [], "offsets": {}, "capture_max_position": capture_max_position}
+    state: dict[str, Any] = {
+        "captures": {},
+        "handles": [],
+        "offsets": {},
+        "capture_max_position": capture_max_position,
+    }
     setattr(model, "_wllm_hidden_state_capture", state)
     for layer in layers:
         module = modules[layer]

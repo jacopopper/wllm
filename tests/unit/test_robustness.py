@@ -429,6 +429,7 @@ def test_max_artifact_bytes_enforced_with_cleanup(tmp_path) -> None:
     # Simulate orchestration cleanup when max_artifact_bytes exceeded
     store.delete_manifest_path(manifest.path)
     assert not artifact_path.exists(), "Artifact file should be deleted after limit exceeded"
+    assert not (tmp_path / "artifacts" / "traces" / "trace_cleanup").exists()
 
 
 # ---------------------------------------------------------------------------

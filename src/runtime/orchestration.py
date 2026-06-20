@@ -346,17 +346,17 @@ class ExtractionOrchestrator:
             include = {"tokens", "logprobs"} if request.extract.logprobs else {"tokens"}
         tensors: dict[str, Any] = {}
         if "tokens" in include:
-            token_ids = inputs.prompt_token_ids + inputs.generated_token_ids
-            tensors["token_ids"] = np.asarray(token_ids, dtype=np.int64)
+            all_token_ids = inputs.prompt_token_ids + inputs.generated_token_ids
+            tensors["token_ids"] = np.asarray(all_token_ids, dtype=np.int64)
         if "logprobs" in include:
             top_k = request.extract.logprobs.top_k if request.extract.logprobs else None
-            token_ids, logprobs = self._logprob_arrays(inputs, top_k=top_k)
-            tensors["generated_logprob_token_ids"] = token_ids
-            tensors["generated_logprobs"] = logprobs
+            generated_token_ids, generated_logprobs = self._logprob_arrays(inputs, top_k=top_k)
+            tensors["generated_logprob_token_ids"] = generated_token_ids
+            tensors["generated_logprobs"] = generated_logprobs
             if request.extract.logprobs and request.extract.logprobs.include_prompt:
-                token_ids, logprobs = self._logprob_arrays(inputs, top_k=top_k, prompt=True)
-                tensors["prompt_logprob_token_ids"] = token_ids
-                tensors["prompt_logprobs"] = logprobs
+                prompt_token_ids, prompt_logprobs = self._logprob_arrays(inputs, top_k=top_k, prompt=True)
+                tensors["prompt_logprob_token_ids"] = prompt_token_ids
+                tensors["prompt_logprobs"] = prompt_logprobs
         if "hidden_states" in include:
             for hidden in hidden_tensors:
                 tensors[hidden.name] = hidden.tensor
@@ -543,7 +543,7 @@ class ExtractionOrchestrator:
         positions: list[int],
         pool: str | None,
         param: str,
-        token_context: dict[str, int] | None = None,
+        token_context: dict[str, Any] | None = None,
     ) -> Any:
         selected = []
         for layer in layers:
@@ -711,7 +711,7 @@ def _select_positions(
     *,
     pool: str | None,
     param: str,
-    token_context: dict[str, int] | None = None,
+    token_context: dict[str, Any] | None = None,
 ) -> Any:
     if not positions:
         raise InvalidRequestError(

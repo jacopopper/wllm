@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from extractors.planning import ResourceLimits
 from schemas.openai import ChatMessage
 
-EXTRACTION_SCHEMA_VERSION = "wllm.extraction.v1"
+EXTRACTION_SCHEMA_VERSION: Literal["wllm.extraction.v1"] = "wllm.extraction.v1"
 
 LayerSelector: TypeAlias = int | list[int] | Literal["all", "middle", "middle_third"]
 PositionSelector: TypeAlias = int | list[int] | Literal["prompt", "generated", "last", "last_generated"]

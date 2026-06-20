@@ -46,9 +46,8 @@ def load_trace_bundle(root: str | Path, manifest: TraceBundleManifest | Mapping[
         raise TraceLoadError("Trace bundle payload does not match wllm.trace.v1.") from exc
     if trace.schema_version != bundle_manifest.schema_version:
         raise TraceLoadError(
-            f"Trace schema version mismatch: manifest={
-                bundle_manifest.schema_version!r}, payload={
-                trace.schema_version!r}."
+            f"Trace schema version mismatch: "
+            f"manifest={bundle_manifest.schema_version!r}, payload={trace.schema_version!r}."
         )
     if trace.id != bundle_manifest.trace_id:
         raise TraceLoadError(f"Trace ID mismatch: manifest={bundle_manifest.trace_id!r}, payload={trace.id!r}.")

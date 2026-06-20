@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -30,9 +31,9 @@ def create_app(
     app.state.api_key = api_key
     if api_key is not None:
         app.middleware("http")(_api_key_middleware)
-    app.add_exception_handler(WLLMError, wllm_exception_handler)
-    app.add_exception_handler(RequestValidationError, request_validation_handler)
-    app.add_exception_handler(Exception, unexpected_exception_handler)
+    app.add_exception_handler(WLLMError, cast(Any, wllm_exception_handler))
+    app.add_exception_handler(RequestValidationError, cast(Any, request_validation_handler))
+    app.add_exception_handler(Exception, cast(Any, unexpected_exception_handler))
     app.include_router(router)
     return app
 

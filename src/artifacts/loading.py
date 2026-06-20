@@ -78,10 +78,8 @@ def _validate_tensor_manifest(tensors: dict[str, Any], manifest: ArtifactManifes
         shape, dtype = _shape_and_dtype(tensor)
         if shape != manifest.tensor_shapes.get(name):
             raise ArtifactLoadError(
-                f"Artifact tensor {
-                    name!r} shape mismatch: manifest={
-                    manifest.tensor_shapes.get(name)!r}, actual={
-                    shape!r}."
+                f"Artifact tensor {name!r} shape mismatch: "
+                f"manifest={manifest.tensor_shapes.get(name)!r}, actual={shape!r}."
             )
         expected_dtype = manifest.tensor_storage_dtypes.get(name) or manifest.tensor_dtypes.get(name)
         if dtype != expected_dtype:

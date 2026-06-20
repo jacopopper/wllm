@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from schemas.artifacts import ArtifactManifest, TraceBundleManifest
 
-TRACE_SCHEMA_VERSION = "wllm.trace.v1"
+TRACE_SCHEMA_VERSION: Literal["wllm.trace.v1"] = "wllm.trace.v1"
 
 
 class TensorRecord(BaseModel):

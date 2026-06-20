@@ -94,7 +94,8 @@ def default_vllm_capabilities(
                 "Selected transformer-block token hidden states require "
                 "temporary scoped module hooks and tensor_parallel_size=1. "
                 "Replay mode uses an isolated vLLM pooling runner; online "
-                "mode uses an opt-in eager in-process generation runner."
+                "mode uses an opt-in eager in-process generation runner "
+                "with prefix caching disabled."
             ),
             details={
                 "backend": "vllm_scoped_hooks",

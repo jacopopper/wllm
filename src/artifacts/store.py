@@ -43,7 +43,7 @@ class ArtifactStore:
         artifact_id = f"art_{uuid.uuid4().hex}"
         self._ensure_root()
         suffix = ".npz" if format == "npz" else ".pt"
-        path = self._artifact_path(f"{artifact_id}{suffix}")
+        path = self._artifact_path(f"traces/{trace_id}/{artifact_id}{suffix}")
         _, capture_dtypes = _tensor_manifest_metadata(tensors)
         compression_mode = compression or ("compressed" if format == "npz" else None)
         if format == "npz":
@@ -111,7 +111,7 @@ class ArtifactStore:
             )
         self._ensure_root()
         manifest_id = f"bundle_{uuid.uuid4().hex}"
-        path = self._artifact_path(f"{manifest_id}.json")
+        path = self._artifact_path(f"traces/{trace_id}/trace_bundle.json")
         data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         self._write_atomic(path, lambda temporary_path: temporary_path.write_bytes(data))
         return TraceBundleManifest(
@@ -124,10 +124,13 @@ class ArtifactStore:
             trace_id=trace_id,
         )
 
-    def _artifact_path(self, name: str) -> Path:
-        if "/" in name or "\\" in name or name.startswith("."):
+    def _artifact_path(self, relative_path: str) -> Path:
+        if relative_path.startswith("/") or "\\" in relative_path:
             raise InvalidRequestError("Invalid artifact name.", code="invalid_artifact_path")
-        path = (self.root / name).resolve()
+        parts = Path(relative_path).parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise InvalidRequestError("Invalid artifact name.", code="invalid_artifact_path")
+        path = (self.root / relative_path).resolve()
         if self.root not in path.parents:
             raise InvalidRequestError("Artifact path escapes the configured root.", code="invalid_artifact_path")
         return path
@@ -138,9 +141,11 @@ class ArtifactStore:
             path.unlink()
         except FileNotFoundError:
             pass
+        self._remove_empty_parents(path.parent)
 
     def _write_atomic(self, path: Path, writer: Callable[[Path], Any]) -> Any:
-        temporary_path = self._artifact_path(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self._artifact_path(f"{path.relative_to(self.root).as_posix()}.{uuid.uuid4().hex}.tmp")
         try:
             result = writer(temporary_path)
             temporary_path.replace(path)
@@ -150,7 +155,17 @@ class ArtifactStore:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+            self._remove_empty_parents(temporary_path.parent)
             raise
+
+    def _remove_empty_parents(self, path: Path) -> None:
+        current = path
+        while current != self.root and self.root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
 
 
 def _tensor_manifest_metadata(tensors: dict[str, Any]) -> tuple[dict[str, list[int]], dict[str, str]]:

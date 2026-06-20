@@ -20,23 +20,12 @@
 |------|:----------:|:------------:|:------------------------:|
 | `test_vllm_token_logprob_extraction_smoke` | ✅ PASS | ✅ PASS | ✅ PASS |
 | `test_vllm_hidden_state_extraction_smoke` | ✅ PASS | ✅ PASS | ❌ UNSUPPORTED (VRAM) |
-| `test_vllm_online_hidden_state_extraction_smoke` | ✅ PASS | ❌ FAIL (position mapping) | ❌ UNSUPPORTED (VRAM) |
-| `test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly` | ❌ FAIL (tokenizer compat) | ❌ FAIL (tokenizer compat) | ❌ UNSUPPORTED (VRAM) |
+| `test_vllm_online_hidden_state_extraction_smoke` | ✅ PASS | ✅ PASS | ❌ UNSUPPORTED (VRAM) |
+| `test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly` | ✅ PASS | ✅ PASS | ❌ UNSUPPORTED (VRAM) |
 
 ### Failure Details
 
-1. **test_vllm_hidden_state_extraction_replays_full_sequence_repeatedly (Qwen + Llama)**:
-   - Error: `AttributeError: Qwen2Tokenizer has no attribute all_special_tokens_extended` (Qwen) / `AttributeError: TokenizersBackend has no attribute all_special_tokens_extended` (Llama)
-   - Root cause: `transformers` 5.12.1 with vLLM 0.10.2 — the `prewarm_hidden_states()` call creates a second vLLM instance (pooling runner) which triggers a tokenizer caching path that accesses `all_special_tokens_extended`, a property removed in newer `transformers`.
-   - Affected architectures: **All models** (tokenizer-specific, not architecture-specific).
-   - Workaround: Single hidden-state extractions work correctly; only repeated prewarmed extractions fail.
-
-2. **test_vllm_online_hidden_state_extraction_smoke (Llama-3.2-3B)**:
-   - Error: `UnsupportedExtractionError: Captured hidden states do not cover requested positions`
-   - Root cause: Position mapping for online capture on Llama-3.2-3B resolves positions differently than expected. The prompt-prefix slicing logic doesn't align with the actual captured tensor positions.
-   - Affected architecture: **Llama family only** — Qwen3 online capture works correctly.
-
-3. **Hidden state extraction (Mistral-7B-Instruct-v0.3)**:
+1. **Hidden state extraction (Mistral-7B-Instruct-v0.3)**:
    - Error: `UnsupportedExtractionError: Hidden-state extraction is not available`
    - Root cause: Replay capture requires `gpu_memory_utilization <= 0.50` to leave room for a second model instance. Mistral-7B (~14.5GB) does not fit in 12GB (0.50 of 24GB). Reducing `gpu_memory_utilization` to levels that satisfy the constraint would leave insufficient KV cache (< 1 GB).
    - Affected architecture: **All 7B+ models** on 24GB GPUs.
@@ -52,8 +41,8 @@
 | **Logprob extraction (top-k)** | ✅ | ✅ | ✅ |
 | **Prompt logprobs** | ✅ | ✅ | ✅ |
 | **Hidden state replay** | ✅ | ✅ | ❌ VRAM (7B too large) |
-| **Hidden state online** | ✅ | ❌ Position mapping | ❌ VRAM (7B too large) |
-| **Prewarmed replay** | ❌ Tokenizer compat | ❌ Tokenizer compat | ❌ VRAM |
+| **Hidden state online** | ✅ | ✅ | ❌ VRAM (7B too large) |
+| **Prewarmed replay** | ✅ | ✅ | ❌ VRAM |
 | **NPZ artifacts** | ✅ | ✅ | ✅ (token/logprob only) |
 | **PT artifacts** | ✅ | ✅ | ✅ (token/logprob only) |
 | **Artifact round-trip** | ✅ | ✅ | ✅ |
@@ -85,8 +74,8 @@ Notes:
 
 ### 2. Online Hidden State Capture
 - **Qwen3-0.6B**: Works correctly. Position mapping aligns with prompt-prefix slicing.
-- **Llama-3.2-3B**: Fails. `_select_positions` rejects captured positions because the online capture produces a tensor whose sequence dimension does not cover the requested prompt positions. This is likely caused by a difference in how the Llama architecture's KV cache interacts with the eager in-process runner's hook output.
-- **Mistral-7B-Instruct-v0.3**: Not tested (VRAM constraint prevents online capture setup).
+- **Llama-3.2-3B**: Works after BOS-aware prompt-length estimation for the dense-prefix capture filter.
+- **Mistral-7B-Instruct-v0.3**: Not tested for hidden-state capture on this 24GB GPU due to the model memory footprint.
 
 ### 3. Hidden State Replay VRAM Requirements
 - Hidden state replay requires `gpu_memory_utilization <= 0.50` to leave room for the isolated pooling runner (second model instance).
@@ -106,9 +95,7 @@ Notes:
 Llama-3.2-3B has significantly less KV cache headroom at the same `gpu_memory_utilization` because its weight memory (6GB) consumes most of the budget.
 
 ### 5. Tokenizer Compatibility (All Models)
-- **transformers 5.12.1 + vLLM 0.10.2**: The `all_special_tokens_extended` attribute has been removed from tokenizer classes in newer `transformers` versions. vLLM 0.10.2's tokenizer caching path accesses this attribute, causing errors when initializing a second vLLM instance (pooling runner for replay prewarming).
-- This is a cross-architecture issue affecting all models, not specific to any model family.
-- Single-instance hidden state extraction works correctly; only the prewarming path triggers this error.
+- **transformers 5.12.1 + vLLM 0.10.2**: wllm applies a compatibility shim for `all_special_tokens_extended` before importing vLLM. Prewarmed replay is verified on Qwen3-0.6B and Llama-3.2-3B with this stack.
 
 ### 6. Resolved Architecture Strings
 | Model | vLLM Resolved Architecture |
@@ -121,15 +108,13 @@ All three use Flash Attention backend on V1 engine.
 
 ## Recommendations
 
-1. **transformers compatibility**: Pin transformers to a version compatible with vLLM 0.10.2, or backport the `all_special_tokens_extended` attribute. This is the single biggest issue blocking repeated hidden-state replay across all architectures.
+1. **Keep tokenizer compatibility covered**: Retain regression coverage for prewarmed replay under vLLM 0.10.2 + transformers 5.12.1.
 
-2. **Llama online capture**: Investigate position mapping for Llama architectures in online hidden state capture. The eager in-process runner's hook output may have a different sequence dimension layout than Qwen models.
-
-3. **Large model hidden states**: For >6B models on 24GB GPUs, consider:
-   - Online capture mode (avoid second instance) — but this requires fixing Llama online capture first.
+2. **Large model hidden states**: For >6B models on 24GB GPUs, consider:
+   - Online capture mode (avoid second instance) where eager execution memory permits.
    - Reduce model precision (INT8/INT4 quantization) — currently unsupported by wllm.
    - Use larger GPUs (48GB+) for 7B+ models with hidden state replay.
 
-4. **Llama chat template**: Document that Llama base models require prompt-based completions. Consider adding a `--chat-template` CLI option for injecting a custom template, or auto-detecting instruct variants.
+3. **Llama chat template**: Document that Llama base models require prompt-based completions. Consider adding a `--chat-template` CLI option for injecting a custom template, or auto-detecting instruct variants.
 
-5. **Future architectures**: Test with Llama-3.2-3B-Instruct to verify chat template availability. Test Gemma and Phi model families for wider architecture coverage.
+4. **Future architectures**: Test with Llama-3.2-3B-Instruct to verify chat template availability. Test Gemma and Phi model families for wider architecture coverage.
