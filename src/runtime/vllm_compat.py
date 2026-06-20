@@ -4,6 +4,7 @@ import importlib
 import importlib.metadata
 import inspect
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,44 @@ class VLLMImports:
     SamplingParams: Any
 
 
+@dataclass(frozen=True)
+class OnlineHiddenStateCapture:
+    output: Any
+    tensors: dict[int, Any]
+    capture_site: str
+    capture_phase: str
+    metadata: dict[str, Any]
+    overhead_ms: float
+
+
+def _apply_transformers_compat() -> None:
+    """Apply compatibility shims for transformers >= 5.0 with vLLM 0.10.2.
+
+    transformers 5.x removed PreTrainedTokenizerBase.all_special_tokens_extended,
+    but vLLM 0.10.2 still accesses it. Restore it as a property that delegates
+    to all_special_tokens (which returns the same list of token strings).
+    """
+    try:
+        from transformers import PreTrainedTokenizerBase
+
+        if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+            # Attach a property that delegates to all_special_tokens.
+            # In transformers 4.x all_special_tokens_extended returned
+            # List[Union[str, AddedToken]]; vLLM treats the result as
+            # a list of strings so the plain-string all_special_tokens
+            # is compatible.
+            def _get_all_special_tokens_extended(self):  # type: ignore[no-untyped-def]
+                return self.all_special_tokens
+
+            PreTrainedTokenizerBase.all_special_tokens_extended = property(
+                _get_all_special_tokens_extended
+            )
+    except Exception:
+        # If transformers isn't available, the vLLM import will fail
+        # with its own error — let it.
+        pass
+
+
 def import_vllm() -> VLLMImports:
     try:
         version = importlib.metadata.version("vllm")
@@ -36,6 +75,10 @@ def import_vllm() -> VLLMImports:
                     "installed": version,
                 },
             )
+        # Compatibility shim: transformers >= 5.0 removed all_special_tokens_extended
+        # which vLLM 0.10.2 still accesses. Restore it as an alias for all_special_tokens.
+        _apply_transformers_compat()
+
         module = importlib.import_module("vllm")
         return VLLMImports(
             module=module,
@@ -69,7 +112,7 @@ def supported_parameter_names(callable_obj: Any) -> set[str] | None:
 
 
 def pooling_runner_kwargs(version: str | None) -> dict[str, Any]:
-    common = {"enforce_eager": True}
+    common = {"enforce_eager": True, "enable_prefix_caching": False}
     if version is not None and Version(version) >= Version("0.10"):
         # vLLM 0.10 converts causal models to embedding models for generic
         # pooling. Its ALL pooler is encode-only, so use LAST for the public
@@ -263,7 +306,7 @@ def capture_pooling_hidden_states(
             continue
         for layer, tensor in result.items():
             layer_index = int(layer)
-            captures[layer_index] = tensor
+            captures[layer_index] = _combine_layer_captures(tensor)
             missing.discard(layer_index)
     if missing:
         raise UnsupportedExtractionError(
@@ -273,6 +316,113 @@ def capture_pooling_hidden_states(
             details={"missing_layers": sorted(missing), "captured_layers": sorted(captures)},
         )
     return captures
+
+
+def capture_online_hidden_states(
+    llm: Any,
+    *,
+    layers: list[int],
+    generate: Any,
+    capture_max_position: int | None = None,
+) -> OnlineHiddenStateCapture:
+    """Capture transformer block outputs from the active generation LLM.
+
+    Hooks are installed immediately before the supplied generation callable and
+    removed in a finally path. The returned metadata is best-effort because vLLM
+    does not expose stable public prefill/decode hook boundaries here.
+    """
+
+    unique_layers = _dedupe_ints(layers)
+    install_started = time.perf_counter()
+    try:
+        install_results = _apply_model_to_workers(
+            llm,
+            lambda model: _install_hidden_state_hooks(
+                model,
+                unique_layers,
+                capture_max_position=capture_max_position,
+            ),
+        )
+    except Exception as exc:
+        try:
+            _apply_model_to_workers(llm, _pop_hidden_state_hooks)
+        except Exception:
+            pass
+        raise UnsupportedExtractionError(
+            "Could not install scoped online hidden-state capture hooks on the active vLLM generation runner.",
+            code="online_hidden_states_unavailable",
+            param="extract.hidden_states",
+            details={"exception": repr(exc)},
+        ) from exc
+    install_ms = (time.perf_counter() - install_started) * 1000.0
+
+    install_errors = [result for result in install_results if isinstance(result, dict) and result.get("error")]
+    if install_errors:
+        try:
+            _apply_model_to_workers(llm, _pop_hidden_state_hooks)
+        except Exception:
+            pass
+        raise UnsupportedExtractionError(
+            "The active vLLM generation runner does not expose compatible transformer block modules.",
+            code="online_hidden_states_unavailable",
+            param="extract.hidden_states",
+            details={"errors": install_errors},
+        )
+
+    output: Any | None = None
+    generate_error: Exception | None = None
+    try:
+        output = generate()
+    except Exception as exc:
+        generate_error = exc
+
+    cleanup_started = time.perf_counter()
+    try:
+        capture_results = _apply_model_to_workers(llm, _pop_hidden_state_hooks)
+    except Exception as exc:
+        if generate_error is not None:
+            raise UnsupportedExtractionError(
+                "Online hidden-state capture cleanup failed after generation failed.",
+                code="online_hidden_states_unavailable",
+                param="extract.hidden_states",
+                details={"exception": repr(generate_error), "cleanup_exception": repr(exc)},
+            ) from generate_error
+        raise UnsupportedExtractionError(
+            "Could not remove scoped online hidden-state capture hooks from the active vLLM generation runner.",
+            code="online_hidden_states_unavailable",
+            param="extract.hidden_states",
+            details={"exception": repr(exc)},
+        ) from exc
+    cleanup_ms = (time.perf_counter() - cleanup_started) * 1000.0
+
+    if generate_error is not None:
+        raise generate_error
+
+    captures = _combine_capture_results(capture_results)
+    missing = set(unique_layers) - set(captures)
+    if missing:
+        raise UnsupportedExtractionError(
+            "The active vLLM generation runner did not capture every requested hidden-state layer.",
+            code="online_hidden_state_layer_unavailable",
+            param="extract.hidden_states",
+            details={"missing_layers": sorted(missing), "captured_layers": sorted(captures)},
+        )
+
+    return OnlineHiddenStateCapture(
+        output=output,
+        tensors=captures,
+        capture_site="transformer_block_output",
+        capture_phase="prompt_prefill_decode_best_effort",
+        metadata={
+            "hook_scope": "active_generation_runner",
+            "boundary_source": "forward_hook_chunk_shapes",
+            "install_ms": install_ms,
+            "cleanup_ms": cleanup_ms,
+            "layer_chunk_shapes": _layer_chunk_shapes(capture_results),
+            "capture_filter": _capture_filter_metadata(capture_max_position),
+        },
+        overhead_ms=install_ms + cleanup_ms,
+    )
 
 
 def _encode_pooling_token_ids(pooling_llm: Any, token_ids: list[int]) -> Any:
@@ -296,7 +446,7 @@ def _apply_model_to_workers(pooling_llm: Any, func: Any) -> list[Any]:
         return executor.apply_model(func)
     if hasattr(pooling_llm, "apply_model"):
         return pooling_llm.apply_model(func)
-    raise AttributeError("The vLLM pooling runner does not expose apply_model or model_executor.apply_model.")
+    raise AttributeError("The vLLM runner does not expose apply_model or model_executor.apply_model.")
 
 
 def _candidate_configs(llm: Any) -> list[Any]:
@@ -343,7 +493,12 @@ def _first_int_attr(obj: Any, names: list[str]) -> int | None:
     return None
 
 
-def _install_hidden_state_hooks(model: Any, layers: list[int]) -> dict[str, Any]:
+def _install_hidden_state_hooks(
+    model: Any,
+    layers: list[int],
+    *,
+    capture_max_position: int | None = None,
+) -> dict[str, Any]:
     _remove_existing_hidden_state_hooks(model)
     modules = _locate_layer_modules(model)
     if modules is None:
@@ -351,7 +506,7 @@ def _install_hidden_state_hooks(model: Any, layers: list[int]) -> dict[str, Any]
     invalid = [layer for layer in layers if layer < 0 or layer >= len(modules)]
     if invalid:
         return {"error": "layer_index_out_of_range", "invalid_layers": invalid, "num_layers": len(modules)}
-    state = {"captures": {}, "handles": []}
+    state = {"captures": {}, "handles": [], "offsets": {}, "capture_max_position": capture_max_position}
     setattr(model, "_wllm_hidden_state_capture", state)
     for layer in layers:
         module = modules[layer]
@@ -359,10 +514,18 @@ def _install_hidden_state_hooks(model: Any, layers: list[int]) -> dict[str, Any]
         def hook(_module: Any, _inputs: tuple[Any, ...], output: Any, *, layer_index: int = layer) -> None:
             tensor = _first_tensor(output)
             if tensor is not None:
-                state["captures"][layer_index] = _to_cpu_tensor(tensor)
+                offset = int(state["offsets"].get(layer_index, 0))
+                state["offsets"][layer_index] = offset + _tensor_row_count(tensor)
+                tensor = _slice_capture_prefix(tensor, offset, state["capture_max_position"])
+                if tensor is not None:
+                    state["captures"].setdefault(layer_index, []).append(_to_cpu_tensor(tensor))
 
         state["handles"].append(module.register_forward_hook(hook))
-    return {"installed_layers": layers, "num_layers": len(modules)}
+    return {
+        "installed_layers": layers,
+        "num_layers": len(modules),
+        "capture_filter": _capture_filter_metadata(capture_max_position),
+    }
 
 
 def _pop_hidden_state_hooks(model: Any) -> dict[int, Any]:
@@ -436,6 +599,91 @@ def _to_cpu_tensor(tensor: Any) -> Any:
     if callable(copy):
         return copy()
     return tensor
+
+
+def _tensor_row_count(tensor: Any) -> int:
+    shape = getattr(tensor, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[0])
+    import numpy as np
+
+    return int(np.asarray(tensor).shape[0])
+
+
+def _slice_capture_prefix(tensor: Any, offset: int, capture_max_position: int | None) -> Any | None:
+    if capture_max_position is None:
+        return tensor
+    row_count = _tensor_row_count(tensor)
+    if row_count <= 0 or offset > capture_max_position:
+        return None
+    keep = min(row_count, capture_max_position - offset + 1)
+    if keep <= 0:
+        return None
+    if keep == row_count:
+        return tensor
+    return tensor[:keep]
+
+
+def _combine_layer_captures(captures: Any) -> Any:
+    if not isinstance(captures, list):
+        return captures
+    if not captures:
+        return captures
+    if len(captures) == 1:
+        return captures[0]
+    first = captures[0]
+    if _is_torch_tensor(first) and all(_is_torch_tensor(item) for item in captures):
+        import torch
+
+        return torch.cat(captures, dim=0)
+    import numpy as np
+
+    return np.concatenate([np.asarray(item) for item in captures], axis=0)
+
+
+def _combine_capture_results(capture_results: list[Any]) -> dict[int, Any]:
+    per_layer: dict[int, list[Any]] = {}
+    for result in capture_results:
+        if not isinstance(result, dict):
+            continue
+        for layer, captures in result.items():
+            layer_index = int(layer)
+            per_layer.setdefault(layer_index, []).append(_combine_layer_captures(captures))
+    return {layer: _combine_layer_captures(captures) for layer, captures in per_layer.items()}
+
+
+def _layer_chunk_shapes(capture_results: list[Any]) -> dict[str, list[list[int]]]:
+    shapes: dict[str, list[list[int]]] = {}
+    for result in capture_results:
+        if not isinstance(result, dict):
+            continue
+        for layer, captures in result.items():
+            chunks = captures if isinstance(captures, list) else [captures]
+            shapes.setdefault(str(int(layer)), []).extend(_shape_of_tensor(chunk) for chunk in chunks)
+    return shapes
+
+
+def _capture_filter_metadata(capture_max_position: int | None) -> dict[str, Any] | None:
+    if capture_max_position is None:
+        return None
+    return {
+        "type": "dense_prefix",
+        "max_source_position": capture_max_position,
+        "captured_source_positions": [0, capture_max_position],
+    }
+
+
+def _shape_of_tensor(tensor: Any) -> list[int]:
+    shape = getattr(tensor, "shape", None)
+    if shape is not None:
+        return [int(dim) for dim in shape]
+    import numpy as np
+
+    return [int(dim) for dim in np.asarray(tensor).shape]
+
+
+def _is_torch_tensor(value: Any) -> bool:
+    return value.__class__.__module__.split(".", 1)[0] == "torch"
 
 
 def _dedupe_ints(values: list[int]) -> list[int]:
