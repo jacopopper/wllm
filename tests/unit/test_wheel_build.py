@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -71,7 +70,6 @@ def test_wheel_entry_point_resolves(built_wheel, tmp_path) -> None:
     assert create.returncode == 0, f"venv creation failed: {create.stderr}"
 
     venv_python = venv_dir / "bin" / "python"
-    venv_pip = venv_dir / "bin" / "pip"
     venv_wllm = venv_dir / "bin" / "wllm"
 
     install = subprocess.run(

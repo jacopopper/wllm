@@ -216,7 +216,7 @@ def test_artifact_trace_context_mismatch_rejected(tmp_path) -> None:
 
 def test_artifact_store_does_not_create_root_until_write(tmp_path) -> None:
     unused_root = tmp_path / "unused-artifacts"
-    store = ArtifactStore(unused_root)
+    ArtifactStore(unused_root)
     assert not unused_root.exists()
 
 
@@ -367,7 +367,7 @@ def test_load_artifact_rejects_corrupt_npz(tmp_path) -> None:
 
 
 def test_load_artifact_rejects_corrupt_pt(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     store = ArtifactStore(tmp_path)
     manifest = store.put(
         trace_id="trace_1",
