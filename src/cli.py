@@ -18,6 +18,39 @@ def _nonempty_model(value: str) -> str:
     return value
 
 
+def _positive_int(value: str) -> int:
+    """argparse type that rejects non-positive integer values (<= 0)."""
+    try:
+        ival = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid positive int value: {value!r}")
+    if ival <= 0:
+        raise argparse.ArgumentTypeError(f"value must be positive, got {ival}")
+    return ival
+
+
+def _valid_port(value: str) -> int:
+    """argparse type that rejects out-of-range port numbers."""
+    try:
+        ival = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid port value: {value!r}")
+    if ival < 1 or ival > 65535:
+        raise argparse.ArgumentTypeError(f"port must be between 1 and 65535, got {ival}")
+    return ival
+
+
+def _fraction(value: str) -> float:
+    """argparse type that rejects out-of-range float values in [0.0, 1.0]."""
+    try:
+        fval = float(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}")
+    if fval < 0.0 or fval > 1.0:
+        raise argparse.ArgumentTypeError(f"value must be between 0.0 and 1.0, got {fval}")
+    return fval
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wllm",
@@ -28,11 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Start the OpenAI-compatible server.")
     serve.add_argument("model", type=_nonempty_model, help="Model name or local model path to load with vLLM.")
     serve.add_argument("--host", default="127.0.0.1", help="Bind host.")
-    serve.add_argument("--port", type=int, default=8000, help="Bind port.")
+    serve.add_argument("--port", type=_valid_port, default=8000, help="Bind port.")
     serve.add_argument("--dtype", default="auto", help="vLLM dtype, for example auto, float16, bfloat16.")
-    serve.add_argument("--tensor-parallel-size", type=int, default=1)
-    serve.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    serve.add_argument("--max-model-len", type=int, default=None, help="Maximum model context length passed to vLLM.")
+    serve.add_argument("--tensor-parallel-size", type=_positive_int, default=1)
+    serve.add_argument("--gpu-memory-utilization", type=_fraction, default=0.9)
+    serve.add_argument(
+        "--max-model-len", type=_positive_int, default=None,
+        help="Maximum model context length passed to vLLM.",
+    )
     serve.add_argument("--tokenizer", default=None, help="Tokenizer name or path passed to vLLM.")
     serve.add_argument("--served-model-name", default=None, help="Model name returned by /v1/models and in responses.")
     serve.add_argument("--api-key", default=None, help="Optional API key required on all requests.")

@@ -535,3 +535,59 @@ def test_serve_without_model_mentions_model_in_error(capsys) -> None:
     assert excinfo.value.code != 0
     captured = capsys.readouterr()
     assert "model" in captured.err.lower() or "required" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Edge-case validation: negative port, non-positive tensor-parallel-size,
+# out-of-range gpu-memory-utilization, non-positive max-model-len
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_port", ["-1", "0", "65536", "99999", "-100"])
+def test_port_rejects_out_of_range(bad_port: str) -> None:
+    """--port rejects negative, zero, and >65535 values."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--port", bad_port])
+
+
+@pytest.mark.parametrize("bad_tp", ["0", "-1", "-8"])
+def test_tensor_parallel_size_rejects_non_positive(bad_tp: str) -> None:
+    """--tensor-parallel-size rejects zero and negative values."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--tensor-parallel-size", bad_tp])
+
+
+@pytest.mark.parametrize("bad_gmu", ["-0.1", "1.1", "2.0", "-1.0"])
+def test_gpu_memory_utilization_rejects_out_of_range(bad_gmu: str) -> None:
+    """--gpu-memory-utilization rejects values outside [0.0, 1.0]."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", bad_gmu])
+
+
+@pytest.mark.parametrize("bad_ml", ["0", "-1", "-128"])
+def test_max_model_len_rejects_non_positive(bad_ml: str) -> None:
+    """--max-model-len rejects zero and negative values."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--max-model-len", bad_ml])
+
+
+def test_port_accepts_boundary_values() -> None:
+    """--port accepts 1 and 65535 (boundary values)."""
+    parser = cli.build_parser()
+    args = parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--port", "1"])
+    assert args.port == 1
+    args = parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--port", "65535"])
+    assert args.port == 65535
+
+
+def test_gpu_memory_utilization_accepts_boundary_values() -> None:
+    """--gpu-memory-utilization accepts 0.0 and 1.0 (boundary values)."""
+    parser = cli.build_parser()
+    args = parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", "0.0"])
+    assert args.gpu_memory_utilization == 0.0
+    args = parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", "1.0"])
+    assert args.gpu_memory_utilization == 1.0

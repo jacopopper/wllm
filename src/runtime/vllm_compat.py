@@ -1,3 +1,207 @@
+"""vLLM compatibility layer for wllm.
+
+This module is the single point of contact with private vLLM internals.
+Every access to a non-public vLLM API, attribute, or data structure is
+documented below with the observed vLLM version, expected shape, and
+failure behavior when the underlying API changes.
+
+**Supported vLLM version:** 0.10.2 (exact match enforced at import time).
+
+=======================================================================
+Catalog of private vLLM API dependencies
+=======================================================================
+
+Each entry lists the private API surface, the function using it, the
+observed shape on vLLM 0.10.2, and expected failure mode if the API
+changes in a future vLLM release.
+
+-----------------------------------------------------------------------
+1. ``LLM.apply_model(func)``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_apply_model_to_workers()``
+   **vLLM 0.10.2 shape:**
+      Method on the model executor (``llm_engine.model_executor``)
+      that runs a callable on every model worker and returns a list of
+      per-worker results.  Also accessible directly on the ``LLM``
+      instance as a convenience path.
+   **Fallback chain:**
+      a) ``pooling_llm.llm_engine.model_executor.apply_model(func)``
+      b) ``pooling_llm.apply_model(func)``
+   **Failure behavior:**
+      If neither path exposes ``apply_model``, an ``AttributeError`` is
+      raised at the call site and converted to
+      ``UnsupportedExtractionError(code="hidden_states_unavailable")``
+      or ``code="online_hidden_states_unavailable"``.
+
+-----------------------------------------------------------------------
+2. ``LLM.encode(...)``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_encode_pooling_token_ids()``
+   **vLLM 0.10.2 shape:**
+      Method that accepts a list of dicts (``[{"prompt_token_ids": [...]}]``)
+      and returns pooling output.  The ``pooling_task`` kwarg is set to
+      ``"embed"`` when ``LLM.supported_tasks`` contains ``"embed"``.
+   **Fallback:**
+      Tries ``pooling_llm.encode([{"prompt_token_ids": token_ids}], ...)``
+      first; if that raises ``TypeError``, attempts
+      ``pooling_llm.encode(prompt_token_ids=[token_ids], ...)``.
+   **Failure behavior:**
+      If neither signature works, the original ``TypeError`` is
+      re-raised, which the caller converts to
+      ``UnsupportedExtractionError(code="hidden_states_unavailable")``.
+
+-----------------------------------------------------------------------
+3. ``LLM.supported_tasks``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_encode_pooling_token_ids()``,
+      ``extract_supported_runner_types()``
+   **vLLM 0.10.2 shape:**
+      An iterable of strings (e.g., ``["generate", "embed"]``) on the
+      ``LLM`` instance.  Used to decide whether to pass
+      ``pooling_task="embed"`` to ``encode()``.
+   **Failure behavior:**
+      Missing or ``None`` attribute is handled gracefully: the
+      ``pooling_task`` kwarg is simply omitted.
+
+-----------------------------------------------------------------------
+4. ``LLM.llm_engine`` / ``LLM.engine``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_apply_model_to_workers()``,
+      ``_candidate_configs()``
+   **vLLM 0.10.2 shape:**
+      The internal vLLM engine object.  ``llm_engine`` is the primary
+      attribute name; ``engine`` is probed as a fallback in config
+      resolution paths.
+   **Failure behavior:**
+      ``getattr(pooling_llm, "llm_engine", None)`` returns ``None``
+      when the attribute is absent; the callers handle ``None`` by
+      skipping the dependent code path.
+
+-----------------------------------------------------------------------
+5. ``llm_engine.model_executor``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_apply_model_to_workers()``
+   **vLLM 0.10.2 shape:**
+      The model executor object has an ``apply_model`` method (see #1).
+   **Failure behavior:**
+      ``AttributeError`` if ``model_executor`` is absent; handled at
+      the ``_apply_model_to_workers`` level.
+
+-----------------------------------------------------------------------
+6. ``llm_engine.model_config`` / ``LLM.model_config``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_candidate_configs()``,
+      ``extract_model_topology()``, ``extract_attention_backend()``,
+      ``extract_supported_runner_types()``
+   **vLLM 0.10.2 shape:**
+      A model configuration object containing HuggingFace config
+      references.  Probed through multiple paths:
+        - ``llm_engine.model_config``
+        - ``engine.model_config``
+        - ``model_config`` (directly on LLM)
+   **Failure behavior:**
+      Missing attribute → silently skipped in ``_candidate_configs()``;
+      topology extraction returns ``None`` when no config path yields
+      layer/head/hidden_size counts.
+
+-----------------------------------------------------------------------
+7. ``model_config.hf_config`` / ``model_config.hf_text_config``
+-----------------------------------------------------------------------
+   **Accessed in:** ``_candidate_configs()``,
+      ``extract_model_topology()``
+   **vLLM 0.10.2 shape:**
+      The underlying HuggingFace model config objects.  ``hf_config``
+      is the primary accessor; ``hf_text_config`` is probed for VLMs
+      with separate text configs.  Nested ``hf_config`` /
+      ``text_config`` attributes are also probed.
+   **Failure behavior:**
+      Missing → the config object itself is used as fallback for
+      topology attribute probing; if it lacks the expected layer/head
+      attributes, topology extraction returns ``None``.
+
+-----------------------------------------------------------------------
+8. Model layer module access paths
+-----------------------------------------------------------------------
+   **Accessed in:** ``_locate_layer_modules()``
+   **vLLM 0.10.2 shape:**
+      Sequential module container probed through these attribute paths
+      (in order):
+        - ``model.layers`` (most common: Llama, Mistral, Qwen2)
+        - ``model.model.layers`` (nested wrapper)
+        - ``language_model.model.layers`` (multi-modal)
+        - ``transformer.h`` (GPT-2 / older)
+        - ``gpt_neox.layers`` (GPT-NeoX)
+        - ``bert.encoder.layer`` (BERT-family)
+      Must be indexable (``__len__`` + ``__getitem__``).
+   **Failure behavior:**
+      If no path resolves, returns ``None``; the caller reports
+      ``"error": "layer_modules_unavailable"``.
+
+-----------------------------------------------------------------------
+9. HuggingFace config topology attributes
+-----------------------------------------------------------------------
+   **Accessed in:** ``extract_model_topology()``
+   **vLLM 0.10.2 shape (on the HuggingFace config object):**
+      - Layer count: ``num_hidden_layers`` → ``n_layer`` → ``num_layers`` → ``n_layers``
+      - Attention heads: ``num_attention_heads`` → ``n_head`` → ``num_heads`` → ``n_heads``
+      - Hidden size: ``hidden_size`` → ``n_embd`` → ``d_model``
+      Each probe returns the first attribute whose value is a positive
+      ``int`` (``bool`` values are rejected).
+   **Failure behavior:**
+      Missing all candidates → ``RuntimeTopology`` field is ``None``.
+      Topology extraction returns ``None`` when any required field
+      (num_layers) is ``None``.
+
+-----------------------------------------------------------------------
+10. ``model_config.supported_runner_types``
+-----------------------------------------------------------------------
+   **Accessed in:** ``extract_supported_runner_types()``
+   **vLLM 0.10.2 shape:**
+      A string or iterable of strings (e.g., ``"generate"``,
+      ``["generate", "pooling"]``) on the model config.
+   **Failure behavior:**
+      Missing → returns ``None``.
+
+-----------------------------------------------------------------------
+11. Attention backend detection attributes
+-----------------------------------------------------------------------
+   **Accessed in:** ``extract_attention_backend()``
+   **vLLM 0.10.2 shape:**
+      Probed through environment variables first
+      (``VLLM_ATTENTION_BACKEND``, ``VLLM_USE_FLASHINFER``), then
+      through these object attributes on LLM and config objects:
+        - ``attention_backend``
+        - ``attn_backend``
+        - ``selected_attention_backend``
+        - ``_attention_backend``
+   **Failure behavior:**
+      All probes miss → returns ``None``.
+
+-----------------------------------------------------------------------
+12. ``LLM.get_tokenizer()``
+-----------------------------------------------------------------------
+   **Accessed in:** ``vllm_runtime.py`` (uses public API)
+   **vLLM 0.10.2 shape:**
+      Returns a HuggingFace tokenizer instance.  This is a public API
+      on vLLM's ``LLM`` class.  The compat module does not access it
+      directly, but the runtime relies on it for chat template
+      rendering and token decoding.
+
+-----------------------------------------------------------------------
+13. ``PreTrainedTokenizerBase.all_special_tokens_extended`` (transformers compat)
+-----------------------------------------------------------------------
+   **Accessed in:** ``_apply_transformers_compat()``
+   **Context:**
+      transformers >= 5.0 removed ``all_special_tokens_extended``,
+      but vLLM 0.10.2 still accesses it.  We restore it as a property
+      delegating to ``all_special_tokens``.
+   **Failure behavior:**
+      If ``transformers`` is not importable, the compat shim is skipped
+      silently; the vLLM import will fail with its own error.
+
+=======================================================================
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -137,9 +341,27 @@ def pooling_runner_environment(version: str | None) -> dict[str, str]:
 def extract_model_topology(llm: Any) -> RuntimeTopology | None:
     """Best-effort topology read from vLLM public-ish model config objects.
 
-    vLLM has changed where it stores the Hugging Face config across releases.
-    This function is intentionally isolated so those probes do not spread through
-    the runtime.
+    **Private API accessed:**
+    HuggingFace config attributes on vLLM's model config (vLLM 0.10.2):
+    ``num_hidden_layers`` / ``n_layer`` / ``num_layers`` / ``n_layers``,
+    ``num_attention_heads`` / ``n_head`` / ``num_heads`` / ``n_heads``,
+    ``hidden_size`` / ``n_embd`` / ``d_model``.
+    Config resolution paths documented in ``_candidate_configs()``.
+
+    **Expected shape:**
+    Returns a ``RuntimeTopology`` with integer ``num_layers``,
+    ``num_attention_heads``, and ``hidden_size`` fields.  Any field may
+    be ``None`` if the corresponding config attribute is absent.
+
+    **Failure behavior:**
+    Returns ``None`` when ``num_layers`` cannot be resolved (the
+    minimum required field).  Missing ``num_attention_heads`` or
+    ``hidden_size`` produce ``None`` for those fields on the returned
+    topology object but do not prevent topology extraction.
+
+    vLLM has changed where it stores the Hugging Face config across
+    releases.  This function is intentionally isolated so those probes
+    do not spread through the runtime.
     """
 
     for config in _candidate_configs(llm):
@@ -178,7 +400,22 @@ def extract_model_topology(llm: Any) -> RuntimeTopology | None:
 
 
 def extract_attention_backend(llm: Any, module: Any | None = None) -> str | None:
-    """Best-effort attention backend read for capability reporting."""
+    """Best-effort attention backend read for capability reporting.
+
+    **Private API accessed:**
+    Environment variables ``VLLM_ATTENTION_BACKEND`` and
+    ``VLLM_USE_FLASHINFER`` (checked first).  Then probes config and
+    LLM objects (vLLM 0.10.2) for these attributes:
+    ``attention_backend``, ``attn_backend``,
+    ``selected_attention_backend``, ``_attention_backend``.
+
+    **Expected shape:** a non-empty string (e.g., ``"FLASH_ATTN"``,
+    ``"FLASHINFER"``) or ``None``.
+
+    **Failure behavior:** returns ``None`` when no backend is
+    discoverable through any probe.  This is non-fatal; capability
+    reporting degrades gracefully.
+    """
 
     for env_name in ("VLLM_ATTENTION_BACKEND", "VLLM_USE_FLASHINFER"):
         value = os.environ.get(env_name)
@@ -202,7 +439,18 @@ def extract_attention_backend(llm: Any, module: Any | None = None) -> str | None
 
 
 def extract_supported_runner_types(llm: Any) -> list[str] | None:
-    """Best-effort read of vLLM model_config.supported_runner_types."""
+    """Best-effort read of vLLM model_config.supported_runner_types.
+
+    **Private API accessed:**
+    ``model_config.supported_runner_types`` on vLLM 0.10.2 config objects
+    (probed through ``_candidate_configs()`` paths).
+
+    **Expected shape:** a list of strings (e.g., ``["generate", "pooling"]``)
+    or a single string.  Returns ``None`` when the attribute is absent.
+
+    **Failure behavior:** returns ``None`` gracefully.  Callers treat
+    ``None`` as "unknown" and do not gate critical paths on this value.
+    """
 
     for config in _candidate_configs(llm):
         value = getattr(config, "supported_runner_types", None)
@@ -232,7 +480,8 @@ def capture_pooling_hidden_states(
 
     if not hasattr(pooling_llm, "apply_model") or not hasattr(pooling_llm, "encode"):
         raise UnsupportedExtractionError(
-            "The active vLLM version does not expose the model and encode surfaces required for scoped hidden-state capture.",
+            "The active vLLM version does not expose the model and encode surfaces "
+            "required for scoped hidden-state capture.",
             code="hidden_states_unavailable",
             param="extract.hidden_states",
         )
@@ -426,6 +675,23 @@ def capture_online_hidden_states(
 
 
 def _encode_pooling_token_ids(pooling_llm: Any, token_ids: list[int]) -> Any:
+    """Execute a pooling encode of *token_ids* on the isolated vLLM runner.
+
+    **Private API accessed:**
+    ``LLM.encode(...)`` (vLLM 0.10.2).
+    ``LLM.supported_tasks`` (vLLM 0.10.2).
+
+    **Expected shape:**
+    Primary call signature: ``pooling_llm.encode([{"prompt_token_ids": token_ids}], use_tqdm=False)``.
+    If ``LLM.supported_tasks`` contains ``"embed"``, also passes
+    ``pooling_task="embed"``.
+    Fallback signature (on ``TypeError``): ``pooling_llm.encode(prompt_token_ids=[token_ids], ...)``.
+
+    **Failure behavior:**
+    ``TypeError`` from both signatures is re-raised; the caller
+    (``capture_pooling_hidden_states``) converts it to
+    ``UnsupportedExtractionError(code="hidden_states_unavailable")``.
+    """
     kwargs: dict[str, Any] = {"use_tqdm": False}
     supported_tasks = getattr(pooling_llm, "supported_tasks", None)
     if supported_tasks is not None and "embed" in supported_tasks:
@@ -440,6 +706,20 @@ def _encode_pooling_token_ids(pooling_llm: Any, token_ids: list[int]) -> Any:
 
 
 def _apply_model_to_workers(pooling_llm: Any, func: Any) -> list[Any]:
+    """Apply *func* to every model worker through the private vLLM executor.
+
+    **Private API accessed:**
+    ``LLM.llm_engine.model_executor.apply_model(func)`` (vLLM 0.10.2).
+    Falls back to ``LLM.apply_model(func)`` if the executor path is absent.
+
+    **Expected shape:** returns a ``list`` of per-worker results (one entry
+    per tensor-parallel worker).  Hooks installed by *func* must return
+    dicts keyed by layer index.
+
+    **Failure behavior:** ``AttributeError`` if neither path exposes
+    ``apply_model``.  Callers convert this to an
+    ``UnsupportedExtractionError`` with a clear message.
+    """
     engine = getattr(pooling_llm, "llm_engine", None)
     executor = getattr(engine, "model_executor", None)
     if executor is not None and hasattr(executor, "apply_model"):
@@ -450,6 +730,35 @@ def _apply_model_to_workers(pooling_llm: Any, func: Any) -> list[Any]:
 
 
 def _candidate_configs(llm: Any) -> list[Any]:
+    """Collect all reachable model-config objects from a vLLM ``LLM`` instance.
+
+    **Private API accessed:**
+    vLLM internal config layout (vLLM 0.10.2).  Probes these attribute
+    paths on the ``LLM`` instance:
+
+    ===============================  =====================================
+    Path                             Notes
+    ===============================  =====================================
+    ``llm_engine.model_config.hf_config``        Primary HF config
+    ``llm_engine.model_config.hf_text_config``   VLM text-only config
+    ``llm_engine.model_config``                  Fallback
+    ``engine.model_config.hf_config``            Alternate engine attr
+    ``engine.model_config.hf_text_config``       Alternate engine attr
+    ``engine.model_config``                      Alternate engine fallback
+    ``model_config.hf_config``                   Direct model_config
+    ``model_config.hf_text_config``              Direct model_config
+    ``model_config``                             Direct fallback
+    ===============================  =====================================
+
+    Additionally, each discovered config is inspected for nested
+    ``hf_config``, ``hf_text_config``, and ``text_config`` attributes.
+
+    **Expected shape:** a list of config objects (may contain duplicates;
+    deduplication is done by identity).  The list may be empty.
+
+    **Failure behavior:** missing attributes are silently skipped via
+    ``getattr(..., None)``.  An empty list means no config was reachable.
+    """
     candidates: list[Any] = []
     direct_paths = [
         ("llm_engine", "model_config", "hf_config"),
@@ -499,6 +808,28 @@ def _install_hidden_state_hooks(
     *,
     capture_max_position: int | None = None,
 ) -> dict[str, Any]:
+    """Install forward hooks on selected transformer-block layers.
+
+    **Private API accessed:**
+    PyTorch ``register_forward_hook`` (public API) on layer modules
+    discovered via ``_locate_layer_modules()`` (vLLM-private module
+    layout, vLLM 0.10.2).
+
+    **Expected shape:**
+    Each hook intercepts the forward pass output, extracts the first
+    tensor, detaches and CPU-clones it, and appends it to a per-layer
+    capture list stored on ``model._wllm_hidden_state_capture``.
+
+    Returns a dict with ``installed_layers``, ``num_layers``, and
+    optional ``capture_filter`` metadata.
+
+    **Failure behavior:**
+    Returns ``{"error": "layer_modules_unavailable", ...}`` when
+    ``_locate_layer_modules`` returns ``None``.
+    Returns ``{"error": "layer_index_out_of_range", ...}`` when any
+    requested layer index is outside ``[0, num_layers)``.
+    The caller converts these to ``UnsupportedExtractionError``.
+    """
     _remove_existing_hidden_state_hooks(model)
     modules = _locate_layer_modules(model)
     if modules is None:
@@ -553,6 +884,30 @@ def _remove_existing_hidden_state_hooks(model: Any) -> None:
 
 
 def _locate_layer_modules(model: Any) -> Any | None:
+    """Find the sequential transformer-block container on a vLLM model.
+
+    **Private API accessed:**
+    vLLM model internal layout.  Probing paths (vLLM 0.10.2):
+
+    ===========================  ==============================
+    Architecture pattern         Attribute path
+    ===========================  ==============================
+    Llama / Mistral / Qwen2      ``model.layers``
+    Nested wrapper               ``model.model.layers``
+    Multi-modal                  ``language_model.model.layers``
+    GPT-2 / older                ``transformer.h``
+    GPT-NeoX                     ``gpt_neox.layers``
+    BERT-family                  ``bert.encoder.layer``
+    ===========================  ==============================
+
+    **Expected shape:** a ``ModuleList`` or equivalent sequential container
+    supporting ``__len__`` and ``__getitem__``.
+
+    **Failure behavior:** returns ``None`` when no path resolves.  The
+    caller reports ``"error": "layer_modules_unavailable"`` with the
+    model type name, which surfaces as
+    ``UnsupportedExtractionError(code="hidden_states_unavailable")``.
+    """
     paths = [
         ("model", "layers"),
         ("model", "model", "layers"),
