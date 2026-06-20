@@ -43,6 +43,9 @@ class GeneratedTraceInputs:
     generated_logprobs: list[list[LogprobCandidate]] = field(default_factory=list)
     hidden_states: dict[int, Any] = field(default_factory=dict)
     hidden_state_capture_site: str = "transformer_block_output"
+    hidden_state_capture_mode: str = "replay"
+    hidden_state_capture_phase: str = "replay"
+    hidden_state_capture_metadata: dict[str, Any] = field(default_factory=dict)
     generation_ms: float = 0.0
     capture_ms: float = 0.0
     topology: RuntimeTopology | None = None
@@ -56,6 +59,10 @@ class HiddenStateTensor:
     positions: list[int]
     pool: str | None
     capture_site: str
+    capture_mode: str
+    capture_phase: str
+    position_semantics: dict[str, Any]
+    capture_metadata: dict[str, Any]
 
 
 class ExtractionOrchestrator:
@@ -103,7 +110,8 @@ class ExtractionOrchestrator:
                 param="extract.artifacts.include",
                 details={"missing": "extract.logprobs", "artifact": "logprobs"},
             )
-        if spec.hidden_states and self.capabilities.hidden_states.state == "unsupported":
+        replay_hidden_states = [hidden for hidden in spec.hidden_states if hidden.capture_mode == "replay"]
+        if replay_hidden_states and self.capabilities.hidden_states.state == "unsupported":
             hidden_states_unavailable(
                 details={"capability": self.capabilities.hidden_states.model_dump(mode="json")}
             )
@@ -118,7 +126,12 @@ class ExtractionOrchestrator:
                 param="extract.artifacts.include",
                 details={"missing": "extract.hidden_states", "artifact": "hidden_states"},
             )
-        if spec.artifacts and "hidden_states" in spec.artifacts.include and self.capabilities.hidden_states.state == "unsupported":
+        if (
+            spec.artifacts
+            and "hidden_states" in spec.artifacts.include
+            and replay_hidden_states
+            and self.capabilities.hidden_states.state == "unsupported"
+        ):
             hidden_states_unavailable(
                 details={"capability": self.capabilities.hidden_states.model_dump(mode="json")}
             )
@@ -205,6 +218,7 @@ class ExtractionOrchestrator:
                 },
                 capabilities=self.capabilities.as_metadata(),
                 resolved_selectors=plan.resolved_selectors if plan is not None else {},
+                capture=self._capture_metadata(request, inputs, plan),
             ),
         )
         trace.metadata.timing_ms.generation = inputs.generation_ms
@@ -361,7 +375,12 @@ class ExtractionOrchestrator:
             )
         if not tensors:
             return []
-        manifest = artifact_store.put(trace_id=trace_id, tensors=tensors, format=artifact_request.format)
+        manifest = artifact_store.put(
+            trace_id=trace_id,
+            tensors=tensors,
+            format=artifact_request.format,
+            compression=artifact_request.compression,
+        )
         if manifest.byte_size > limits.max_artifact_bytes:
             artifact_store.delete_manifest_path(manifest.path)
             raise ResourceLimitError(
@@ -465,12 +484,40 @@ class ExtractionOrchestrator:
             )
         hidden_tensors = []
         for index, selection in enumerate(plan.hidden_states):
+            capture_mode = str(selection.get("capture_mode", inputs.hidden_state_capture_mode))
+            capture_phase = _capture_phase_for_positions(
+                selection["positions"],
+                prompt_token_count=len(inputs.prompt_token_ids),
+                capture_mode=capture_mode,
+                default_phase=inputs.hidden_state_capture_phase,
+            )
+            source_positions = _source_positions_for_capture(
+                selection["positions"],
+                prompt_token_count=len(inputs.prompt_token_ids),
+                capture_mode=capture_mode,
+            )
+            position_semantics = _hidden_state_position_semantics(
+                prompt_token_count=len(inputs.prompt_token_ids),
+                generated_token_count=len(inputs.generated_token_ids),
+                selected_positions=selection["positions"],
+                source_positions=source_positions,
+                capture_mode=capture_mode,
+                capture_phase=capture_phase,
+            )
             tensor = self._select_hidden_state_tensor(
                 inputs.hidden_states,
                 layers=selection["layers"],
-                positions=selection["positions"],
+                positions=source_positions,
                 pool=selection["pool"],
                 param=f"extract.hidden_states[{index}]",
+                token_context={
+                    "prompt_token_count": len(inputs.prompt_token_ids),
+                    "generated_token_count": len(inputs.generated_token_ids),
+                    "total_token_count": len(inputs.prompt_token_ids) + len(inputs.generated_token_ids),
+                    "requested_positions": selection["positions"],
+                    "source_positions": source_positions,
+                    "capture_mode": capture_mode,
+                },
             )
             hidden_tensors.append(
                 HiddenStateTensor(
@@ -480,6 +527,10 @@ class ExtractionOrchestrator:
                     positions=selection["positions"],
                     pool=selection["pool"],
                     capture_site=inputs.hidden_state_capture_site,
+                    capture_mode=capture_mode,
+                    capture_phase=capture_phase,
+                    position_semantics=position_semantics,
+                    capture_metadata=inputs.hidden_state_capture_metadata,
                 )
             )
         return hidden_tensors
@@ -492,6 +543,7 @@ class ExtractionOrchestrator:
         positions: list[int],
         pool: str | None,
         param: str,
+        token_context: dict[str, int] | None = None,
     ) -> Any:
         selected = []
         for layer in layers:
@@ -503,7 +555,7 @@ class ExtractionOrchestrator:
                     param=param,
                     details={"layer": layer, "captured_layers": sorted(captured)},
                 )
-            selected.append(_select_positions(source, positions, pool=pool, param=param))
+            selected.append(_select_positions(source, positions, pool=pool, param=param, token_context=token_context))
         return _stack_tensors(selected, param=param)
 
     def _hidden_state_records(
@@ -529,12 +581,44 @@ class ExtractionOrchestrator:
                     layers=hidden.layers,
                     positions=hidden.positions,
                     capture_site=hidden.capture_site,
+                    capture_mode=hidden.capture_mode,  # type: ignore[arg-type]
+                    capture_phase=hidden.capture_phase,
+                    position_semantics=hidden.position_semantics,
+                    capture_metadata=hidden.capture_metadata,
                     data=_tensor_to_jsonable(hidden.tensor) if inline else None,
                     artifact_id=None if inline else artifact_id,
                     byte_size=_tensor_storage_nbytes(hidden.tensor),
                 )
             )
         return records
+
+    def _capture_metadata(
+        self,
+        request: ExtractRequest,
+        inputs: GeneratedTraceInputs,
+        plan: ExtractionPlan | None,
+    ) -> dict[str, Any]:
+        if not request.extract.hidden_states:
+            return {}
+        hidden_selectors = plan.hidden_states if plan is not None else []
+        capture_modes = sorted({str(item.get("capture_mode", inputs.hidden_state_capture_mode))
+                               for item in hidden_selectors})
+        return {
+            "hidden_states": {
+                "capture_modes": capture_modes or [inputs.hidden_state_capture_mode],
+                "capture_site": inputs.hidden_state_capture_site,
+                "capture_phase": inputs.hidden_state_capture_phase,
+                "position_semantics": _hidden_state_position_semantics(
+                    prompt_token_count=len(inputs.prompt_token_ids),
+                    generated_token_count=len(inputs.generated_token_ids),
+                    selected_positions=[],
+                    source_positions=[],
+                    capture_mode=inputs.hidden_state_capture_mode,
+                    capture_phase=inputs.hidden_state_capture_phase,
+                ),
+                "capture_metadata": inputs.hidden_state_capture_metadata,
+            }
+        }
 
     def _hidden_states_artifact_requested(self, request: ExtractRequest) -> bool:
         artifacts = request.extract.artifacts
@@ -549,19 +633,113 @@ class ExtractionOrchestrator:
         return None
 
 
+def _capture_phase_for_positions(
+    positions: list[int],
+    *,
+    prompt_token_count: int,
+    capture_mode: str,
+    default_phase: str,
+) -> str:
+    if capture_mode == "replay":
+        return "replay"
+    if not positions:
+        return default_phase
+    prompt_positions = [position for position in positions if position < prompt_token_count]
+    decode_positions = [position for position in positions if position >= prompt_token_count]
+    if prompt_positions and decode_positions:
+        return "mixed_prompt_prefill_decode"
+    if prompt_positions:
+        return "prompt_prefill"
+    return "decode"
+
+
+def _source_positions_for_capture(
+    positions: list[int],
+    *,
+    prompt_token_count: int,
+    capture_mode: str,
+) -> list[int]:
+    if capture_mode != "online":
+        return positions
+    return [position if position < prompt_token_count else position - 1 for position in positions]
+
+
+def _hidden_state_position_semantics(
+    *,
+    prompt_token_count: int,
+    generated_token_count: int,
+    selected_positions: list[int],
+    source_positions: list[int],
+    capture_mode: str,
+    capture_phase: str,
+) -> dict[str, Any]:
+    total_token_count = prompt_token_count + generated_token_count
+    return {
+        "position_index_space": "combined_prompt_then_generated_tokens",
+        "prompt_span": [0, prompt_token_count],
+        "generated_span": [prompt_token_count, total_token_count],
+        "selected_positions": selected_positions,
+        "source_positions": source_positions,
+        "input_position_semantics": (
+            "A hidden state at prompt/generated input position i is the representation after consuming token i."
+        ),
+        "decoder_only_prediction_semantics": (
+            "For decoder-only generation, the representation that "
+            "predicts a generated token may correspond to the "
+            "previous input position."
+        ),
+        "online_generated_position_mapping": (
+            "For capture_mode=online, generated-token selectors use the "
+            "predictor/source position p - 1 because the original decode "
+            "does not compute a hidden state after consuming the final "
+            "generated token."
+            if capture_mode == "online"
+            else None
+        ),
+        "capture_mode": capture_mode,
+        "capture_phase": capture_phase,
+    }
+
+
 def _is_torch_tensor(value: Any) -> bool:
     return value.__class__.__module__.split(".", 1)[0] == "torch"
 
 
-def _select_positions(tensor: Any, positions: list[int], *, pool: str | None, param: str) -> Any:
+def _select_positions(
+    tensor: Any,
+    positions: list[int],
+    *,
+    pool: str | None,
+    param: str,
+    token_context: dict[str, int] | None = None,
+) -> Any:
     if not positions:
-        raise InvalidRequestError("Hidden-state position selector resolved to no positions.", code="invalid_selector", param=param)
+        raise InvalidRequestError(
+            "Hidden-state position selector resolved to no positions.",
+            code="invalid_selector",
+            param=param)
+    if min(positions) < 0:
+        raise UnsupportedExtractionError(
+            "Captured hidden-state source positions cannot be negative.",
+            code="hidden_state_position_unavailable",
+            param=param,
+            details={"positions": positions},
+        )
     if _tensor_shape(tensor)[0] <= max(positions):
+        shape = _tensor_shape(tensor)
+        details = {
+            "shape": shape,
+            "captured_token_count": shape[0] if shape else 0,
+            "positions": positions,
+            "max_requested_position": max(positions),
+        }
+        if token_context is not None:
+            details.update(token_context)
         raise UnsupportedExtractionError(
             "Captured hidden states do not cover all requested token positions.",
             code="hidden_state_position_unavailable",
             param=param,
-            details={"shape": _tensor_shape(tensor), "positions": positions},
+            details=details,
         )
     if _is_torch_tensor(tensor):
         import torch
@@ -589,7 +767,10 @@ def _select_positions(tensor: Any, positions: list[int], *, pool: str | None, pa
 
 def _stack_tensors(tensors: list[Any], *, param: str) -> Any:
     if not tensors:
-        raise InvalidRequestError("Hidden-state layer selector resolved to no layers.", code="invalid_selector", param=param)
+        raise InvalidRequestError(
+            "Hidden-state layer selector resolved to no layers.",
+            code="invalid_selector",
+            param=param)
     if all(_is_torch_tensor(tensor) for tensor in tensors):
         import torch
 

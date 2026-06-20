@@ -41,7 +41,8 @@ def normalize_layer_selector(selector: int | list[int] | str, num_layers: int) -
     return _dedupe(values)
 
 
-def normalize_head_selector(selector: int | list[int] | Literal["all"], num_heads: int | None) -> list[int] | Literal["all"]:
+def normalize_head_selector(selector: int | list[int] | Literal["all"],
+                            num_heads: int | None) -> list[int] | Literal["all"]:
     if selector == "all":
         return "all"
     if num_heads is None:

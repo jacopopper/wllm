@@ -474,7 +474,8 @@ def test_unknown_request_fields_rejected_with_422() -> None:
     with _client(ComplianceRuntime()) as client:
         response = client.post(
             "/v1/chat/completions",
-            json={"model": "fake-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "foo": "bar"},
+            json={"model": "fake-model", "messages": [{"role": "user",
+                                                       "content": "hi"}], "max_tokens": 4, "foo": "bar"},
         )
     assert response.status_code == 422
     error = _assert_error_envelope(response.json())

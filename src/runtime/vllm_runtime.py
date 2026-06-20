@@ -9,10 +9,14 @@ from typing import Any
 
 from artifacts.store import ArtifactStore
 from extractors.collectors import CollectorRegistry
+from extractors.hidden_states import hidden_states_unavailable
 from extractors.planning import ExtractionPlan, ResourceLimits, RuntimeTopology, compile_extraction_plan
+from extractors.selectors import SelectorValidationError, normalize_layer_selector
 from runtime.capabilities import RuntimeCapabilities, default_vllm_capabilities
 from runtime.orchestration import ExtractionOrchestrator, GeneratedTraceInputs, LogprobCandidate
 from runtime.vllm_compat import (
+    SUPPORTED_VLLM_VERSION,
+    capture_online_hidden_states,
     capture_pooling_hidden_states,
     extract_attention_backend,
     extract_model_topology,
@@ -41,6 +45,8 @@ class VLLMRuntimeConfig:
     seed: int | None = None
     trust_remote_code: bool = False
     local_files_only: bool = False
+    prewarm_hidden_states: bool = False
+    enable_online_hidden_states: bool = False
 
 
 class VLLMRuntime:
@@ -82,10 +88,14 @@ class VLLMRuntime:
                     "max_model_len": self.config.max_model_len,
                     "tokenizer": self.config.tokenizer,
                     "trust_remote_code": self.config.trust_remote_code,
+                    "enforce_eager": True if self.config.enable_online_hidden_states else None,
+                    "enable_prefix_caching": False if self.config.enable_online_hidden_states else None,
                 },
             )
+            env_overrides = {"VLLM_ENABLE_V1_MULTIPROCESSING": "0"} if self.config.enable_online_hidden_states else {}
             try:
-                llm = imports.LLM(**kwargs)
+                with _temporary_environment(env_overrides):
+                    llm = imports.LLM(**kwargs)
                 topology = extract_model_topology(llm)
                 attention_backend = extract_attention_backend(llm, imports.module)
                 supported_runner_types = extract_supported_runner_types(llm)
@@ -96,9 +106,12 @@ class VLLMRuntime:
                     supported_runner_types=supported_runner_types,
                     tensor_parallel_size=self.config.tensor_parallel_size,
                     gpu_memory_utilization=self.config.gpu_memory_utilization,
+                    online_hidden_states=self.config.enable_online_hidden_states,
                 )
             except Exception as exc:
                 details = {"exception": repr(exc), "model": self.config.model}
+                if env_overrides:
+                    details.update(env_overrides)
                 if self.config.local_files_only:
                     details["local_files_only"] = True
                     message = (
@@ -126,10 +139,19 @@ class VLLMRuntime:
             supported_runner_types=self._supported_runner_types,
             tensor_parallel_size=self.config.tensor_parallel_size,
             gpu_memory_utilization=self.config.gpu_memory_utilization,
+            online_hidden_states=self.config.enable_online_hidden_states,
         )
 
     def topology(self) -> RuntimeTopology | None:
         return self._topology
+
+    def prewarm_hidden_states(self) -> None:
+        """Initialize the optional hidden-state extraction runner before serving requests."""
+
+        self._ensure_loaded()
+        self._ensure_replay_hidden_state_runtime_available(self._topology)
+        with self._pooling_lock:
+            self._ensure_pooling_llm()
 
     def list_models(self) -> dict[str, Any]:
         created = int(time.time())
@@ -182,8 +204,38 @@ class VLLMRuntime:
             orchestrator.preflight(request, limits, topology=topology)
             prompt = self._render_extract_prompt(request)
             sampling = self._sampling_params(request, force_logprobs=request.extract.logprobs is not None)
+            capture_mode = self._hidden_state_capture_mode(request)
+            online_capture = None
+            if capture_mode == "replay":
+                self._ensure_replay_hidden_state_runtime_available(topology)
             started = time.perf_counter()
-            outputs = self._llm.generate([prompt], sampling)
+            if capture_mode == "online":
+                requested_layers = self._resolve_hidden_state_layers(request, topology)
+                self._ensure_online_hidden_state_runtime_available(topology)
+                prompt_token_count = self._tokenized_prompt_length(prompt)
+                self._check_hidden_capture_size_for_shape(
+                    request,
+                    layer_count=len(requested_layers),
+                    token_count=self._online_hidden_capture_token_count_upper_bound(
+                        prompt,
+                        request,
+                        prompt_token_count=prompt_token_count,
+                    ),
+                    topology=topology,
+                    limits=limits,
+                )
+                online_capture = capture_online_hidden_states(
+                    self._llm,
+                    layers=requested_layers,
+                    generate=lambda: self._llm.generate([prompt], sampling),
+                    capture_max_position=self._online_hidden_capture_max_prefix_position(
+                        request,
+                        prompt_token_count=prompt_token_count,
+                    ),
+                )
+                outputs = online_capture.output
+            else:
+                outputs = self._llm.generate([prompt], sampling)
             generation_ms = (time.perf_counter() - started) * 1000.0
             output = outputs[0]
             completion = output.outputs[0]
@@ -192,25 +244,47 @@ class VLLMRuntime:
             generated_ids = list(getattr(completion, "token_ids", []) or [])
             token_ids = prompt_ids + generated_ids
             plan = self._compile_post_generation_plan(request, prompt_ids, generated_ids, limits, topology)
-            capture_started = time.perf_counter()
-            hidden_states, hidden_capture_site = self._extract_hidden_states_if_requested(
-                request,
-                token_ids,
-                plan,
-                topology,
-                limits,
-            )
-            capture_ms = (time.perf_counter() - capture_started) * 1000.0 if request.extract.hidden_states else 0.0
+            hidden_capture_mode = capture_mode or "replay"
+            hidden_capture_phase = "replay"
+            hidden_capture_metadata: dict[str, Any] = {}
+            if capture_mode == "online":
+                if online_capture is None:
+                    raise AssertionError("online capture mode did not produce a capture result")
+                hidden_states = online_capture.tensors
+                hidden_capture_site = online_capture.capture_site
+                hidden_capture_phase = online_capture.capture_phase
+                hidden_capture_metadata = online_capture.metadata
+                capture_ms = online_capture.overhead_ms
+                self._check_hidden_capture_size(
+                    request,
+                    token_ids,
+                    plan,
+                    topology,
+                    limits,
+                )
+            else:
+                capture_started = time.perf_counter()
+                hidden_states, hidden_capture_site = self._extract_hidden_states_if_requested(
+                    request,
+                    token_ids,
+                    plan,
+                    topology,
+                    limits,
+                )
+                capture_ms = (time.perf_counter() - capture_started) * 1000.0 if request.extract.hidden_states else 0.0
             inputs = GeneratedTraceInputs(
                 model=self.served_model_name,
                 generation=generation,
                 prompt_token_ids=prompt_ids,
                 generated_token_ids=generated_ids,
-                decoded_tokens=self._decode_tokens(token_ids),
+                decoded_tokens=self._decoded_tokens_for_request(request, token_ids),
                 prompt_logprobs=self._logprob_candidates_from_entries(getattr(output, "prompt_logprobs", None)),
                 generated_logprobs=self._logprob_candidates(completion),
                 hidden_states=hidden_states,
                 hidden_state_capture_site=hidden_capture_site,
+                hidden_state_capture_mode=hidden_capture_mode,
+                hidden_state_capture_phase=hidden_capture_phase,
+                hidden_state_capture_metadata=hidden_capture_metadata,
                 generation_ms=generation_ms,
                 capture_ms=capture_ms,
                 topology=topology,
@@ -243,6 +317,64 @@ class VLLMRuntime:
             limits=limits,
         )
 
+    def _hidden_state_capture_mode(self, request: ExtractRequest) -> str | None:
+        if not request.extract.hidden_states:
+            return None
+        modes = {hidden.capture_mode for hidden in request.extract.hidden_states}
+        if len(modes) > 1:
+            raise UnsupportedExtractionError(
+                "A single extraction request cannot mix hidden-state capture modes yet.",
+                code="mixed_hidden_state_capture_modes_unsupported",
+                param="extract.hidden_states",
+                details={"capture_modes": sorted(modes)},
+            )
+        return next(iter(modes))
+
+    def _resolve_hidden_state_layers(self, request: ExtractRequest, topology: RuntimeTopology | None) -> list[int]:
+        if topology is None:
+            raise UnsupportedExtractionError(
+                "Hidden-state extraction requires runtime topology so selectors can be resolved.",
+                code="hidden_state_topology_unavailable",
+                param="extract.hidden_states",
+            )
+        layers: set[int] = set()
+        try:
+            for index, hidden in enumerate(request.extract.hidden_states):
+                for layer in normalize_layer_selector(hidden.layers, topology.num_layers):
+                    layers.add(layer)
+        except SelectorValidationError as exc:
+            raise InvalidRequestError(str(exc), code="invalid_selector", param=exc.param) from exc
+        return sorted(layers)
+
+    def _ensure_online_hidden_state_runtime_available(self, topology: RuntimeTopology | None) -> None:
+        if not self.config.enable_online_hidden_states:
+            raise UnsupportedExtractionError(
+                "Online hidden-state capture requires starting wllm with --enable-online-hidden-states.",
+                code="online_hidden_states_disabled",
+                param="extract.hidden_states.capture_mode",
+            )
+        if topology is None or topology.hidden_size is None:
+            raise UnsupportedExtractionError(
+                "Online hidden-state extraction requires runtime topology and hidden_size.",
+                code="hidden_state_topology_unavailable",
+                param="extract.hidden_states",
+            )
+        version = self._imports.version if self._imports is not None else None
+        if version != str(SUPPORTED_VLLM_VERSION):
+            raise UnsupportedExtractionError(
+                "Online hidden-state capture is validated only for vLLM 0.10.2.",
+                code="online_hidden_states_unsupported_vllm_version",
+                param="extract.hidden_states.capture_mode",
+                details={"supported": str(SUPPORTED_VLLM_VERSION), "installed": version},
+            )
+        if self.config.tensor_parallel_size != 1:
+            raise UnsupportedExtractionError(
+                "Online hidden-state capture currently supports only tensor_parallel_size=1.",
+                code="online_hidden_state_parallelism_unavailable",
+                param="extract.hidden_states.capture_mode",
+                details={"tensor_parallel_size": self.config.tensor_parallel_size},
+            )
+
     def _extract_hidden_states_if_requested(
         self,
         request: ExtractRequest,
@@ -260,49 +392,161 @@ class VLLMRuntime:
                 param="extract.hidden_states",
             )
         requested_layers = sorted({layer for selection in plan.hidden_states for layer in selection["layers"]})
+        self._ensure_replay_hidden_state_runtime_available(topology)
+        self._check_hidden_capture_size_for_shape(
+            request,
+            layer_count=len(requested_layers),
+            token_count=len(token_ids),
+            topology=topology,
+            limits=limits,
+        )
+        return self._pooling_hidden_states(token_ids, requested_layers), "transformer_block_output"
+
+    def _check_hidden_capture_size(
+        self,
+        request: ExtractRequest,
+        token_ids: list[int],
+        plan: ExtractionPlan | None,
+        topology: RuntimeTopology | None,
+        limits: ResourceLimits,
+    ) -> None:
+        if not request.extract.hidden_states:
+            return
+        if topology is None or plan is None:
+            raise UnsupportedExtractionError(
+                "Hidden-state extraction requires runtime topology so selectors can be resolved.",
+                code="hidden_state_topology_unavailable",
+                param="extract.hidden_states",
+            )
+        requested_layers = sorted({layer for selection in plan.hidden_states for layer in selection["layers"]})
+        self._check_hidden_capture_size_for_shape(
+            request,
+            layer_count=len(requested_layers),
+            token_count=len(token_ids),
+            topology=topology,
+            limits=limits,
+        )
+
+    def _check_hidden_capture_size_for_shape(
+        self,
+        request: ExtractRequest,
+        *,
+        layer_count: int,
+        token_count: int,
+        topology: RuntimeTopology,
+        limits: ResourceLimits,
+    ) -> None:
+        if not request.extract.hidden_states:
+            return
+        estimated_bytes = _estimate_hidden_capture_bytes(
+            layer_count=layer_count,
+            token_count=token_count,
+            topology=topology,
+            dtype=self.config.dtype,
+        )
+        if estimated_bytes > limits.max_total_captured_tensor_bytes:
+            raise ResourceLimitError(
+                "Requested hidden-state capture exceeds the total "
+                "captured tensor byte limit before token-position "
+                "selection.",
+                param="extract.hidden_states",
+                details={
+                    "estimated_raw_capture_bytes": estimated_bytes,
+                    "limit": limits.max_total_captured_tensor_bytes,
+                    "captured_layers": layer_count,
+                    "captured_tokens_per_layer": token_count,
+                    "hidden_size": topology.hidden_size,
+                    "dtype": self.config.dtype,
+                },
+            )
+
+    def _online_hidden_capture_token_count_upper_bound(
+        self,
+        prompt: str,
+        request: ExtractRequest,
+        *,
+        prompt_token_count: int | None = None,
+    ) -> int:
+        prompt_count = prompt_token_count if prompt_token_count is not None else self._tokenized_prompt_length(prompt)
+        if prompt_count is not None:
+            return prompt_count + int(request.max_tokens)
+        if self.config.max_model_len is not None:
+            return self.config.max_model_len
+        return len(prompt.encode("utf-8")) + int(request.max_tokens)
+
+    def _online_hidden_capture_max_prefix_position(
+        self,
+        request: ExtractRequest,
+        *,
+        prompt_token_count: int | None,
+    ) -> int | None:
+        if prompt_token_count is None:
+            return None
+        max_position = -1
+        for hidden in request.extract.hidden_states:
+            prefix_position = _prompt_prefix_position(hidden.positions, prompt_token_count)
+            if prefix_position is None:
+                return None
+            max_position = max(max_position, prefix_position)
+        return max_position if max_position >= 0 else None
+
+    def _tokenized_prompt_length(self, prompt: str) -> int | None:
+        tokenizer = self._llm.get_tokenizer()
+        encode = getattr(tokenizer, "encode", None)
+        if callable(encode):
+            try:
+                return len(encode(prompt, add_special_tokens=False))
+            except TypeError:
+                try:
+                    return len(encode(prompt))
+                except Exception:
+                    return None
+            except Exception:
+                return None
+        tokenize = getattr(tokenizer, "__call__", None)
+        if callable(tokenize):
+            try:
+                encoded = tokenize(prompt)
+            except Exception:
+                return None
+            input_ids = getattr(encoded, "input_ids", None)
+            if input_ids is None and isinstance(encoded, dict):
+                input_ids = encoded.get("input_ids")
+            if input_ids is not None:
+                return len(input_ids)
+        return None
+
+    def _ensure_replay_hidden_state_runtime_available(self, topology: RuntimeTopology | None) -> None:
+        capability = self._replay_hidden_state_capability()
+        if capability.state == "unsupported":
+            hidden_states_unavailable(details={"capability": capability.model_dump(mode="json")})
+        self._ensure_hidden_state_topology_available(topology)
+
+    def _ensure_hidden_state_topology_available(self, topology: RuntimeTopology | None) -> None:
+        if topology is None:
+            raise UnsupportedExtractionError(
+                "Hidden-state extraction requires runtime topology so selectors can be resolved.",
+                code="hidden_state_topology_unavailable",
+                param="extract.hidden_states",
+            )
         if topology.hidden_size is None:
             raise UnsupportedExtractionError(
                 "Hidden-state extraction requires runtime hidden_size so raw capture resource limits can be enforced.",
                 code="hidden_state_topology_unavailable",
                 param="extract.hidden_states",
             )
-        if self.config.tensor_parallel_size != 1:
-            raise UnsupportedExtractionError(
-                "Scoped hidden-state capture is currently supported only for tensor_parallel_size=1.",
-                code="hidden_state_parallelism_unavailable",
-                param="extract.hidden_states",
-                details={"tensor_parallel_size": self.config.tensor_parallel_size},
-            )
-        if self.config.gpu_memory_utilization > 0.5:
-            raise UnsupportedExtractionError(
-                "Scoped hidden-state capture requires gpu_memory_utilization <= 0.5 so the isolated pooling runner can initialize alongside the generation runner.",
-                code="hidden_state_memory_configuration_unavailable",
-                param="extract.hidden_states",
-                details={
-                    "gpu_memory_utilization": self.config.gpu_memory_utilization,
-                    "maximum_supported_for_hidden_states": 0.5,
-                },
-            )
-        estimated_bytes = _estimate_hidden_capture_bytes(
-            layer_count=len(requested_layers),
-            token_count=len(token_ids),
-            topology=topology,
-            dtype=self.config.dtype,
-        )
-        if estimated_bytes > limits.max_total_captured_tensor_bytes:
-            raise ResourceLimitError(
-                "Requested hidden-state capture exceeds the total captured tensor byte limit before token-position selection.",
-                param="extract.hidden_states",
-                details={
-                    "estimated_raw_capture_bytes": estimated_bytes,
-                    "limit": limits.max_total_captured_tensor_bytes,
-                    "captured_layers": len(requested_layers),
-                    "captured_tokens_per_layer": len(token_ids),
-                    "hidden_size": topology.hidden_size,
-                    "dtype": self.config.dtype,
-                },
-            )
-        return self._pooling_hidden_states(token_ids, requested_layers), "transformer_block_output"
+
+    def _replay_hidden_state_capability(self) -> Any:
+        version = self._imports.version if self._imports is not None else None
+        return default_vllm_capabilities(
+            self.config.model,
+            version,
+            attention_backend=self._attention_backend,
+            supported_runner_types=self._supported_runner_types,
+            tensor_parallel_size=self.config.tensor_parallel_size,
+            gpu_memory_utilization=self.config.gpu_memory_utilization,
+            online_hidden_states=False,
+        ).hidden_states
 
     def _pooling_hidden_states(self, token_ids: list[int], layers: list[int]) -> dict[int, Any]:
         with self._pooling_lock:
@@ -393,7 +637,8 @@ class VLLMRuntime:
             "logprobs": logprobs,
             "prompt_logprobs": prompt_logprobs,
         }
-        self._reject_unsupported_sampling_params(imports.SamplingParams, request, candidates, force_logprobs=force_logprobs)
+        self._reject_unsupported_sampling_params(
+            imports.SamplingParams, request, candidates, force_logprobs=force_logprobs)
         kwargs = supported_kwargs(imports.SamplingParams, candidates)
         return imports.SamplingParams(**kwargs)
 
@@ -414,7 +659,8 @@ class VLLMRuntime:
         required = {"max_tokens"}
         requested_logprobs = getattr(request, "logprobs", None)
         for name, value in candidates.items():
-            if not force_logprobs and name == "logprobs" and (requested_logprobs is False or requested_logprobs is None):
+            if not force_logprobs and name == "logprobs" and (
+                    requested_logprobs is False or requested_logprobs is None):
                 continue
             if name in {"logprobs", "prompt_logprobs"} and value is not None:
                 required.add(name)
@@ -518,6 +764,23 @@ class VLLMRuntime:
         if not token_ids:
             return []
         tokenizer = self._llm.get_tokenizer()
+        batch_decode = getattr(tokenizer, "batch_decode", None)
+        if callable(batch_decode):
+            try:
+                return list(
+                    batch_decode(
+                        [[token_id] for token_id in token_ids],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                )
+            except TypeError:
+                try:
+                    return list(batch_decode([[token_id] for token_id in token_ids]))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         decoded = []
         for token_id in token_ids:
             try:
@@ -525,6 +788,11 @@ class VLLMRuntime:
             except Exception:
                 decoded.append(f"<token:{token_id}>")
         return decoded
+
+    def _decoded_tokens_for_request(self, request: ExtractRequest, token_ids: list[int]) -> list[str]:
+        if not request.extract.tokens and request.extract.logprobs is None:
+            return []
+        return self._decode_tokens(token_ids)
 
     def _logprob_candidates(self, completion: Any) -> list[list[LogprobCandidate]]:
         return self._logprob_candidates_from_entries(getattr(completion, "logprobs", None))
@@ -538,7 +806,14 @@ class VLLMRuntime:
                 continue
             for token_id, logprob_obj in entry.items():
                 logprob = float(getattr(logprob_obj, "logprob", logprob_obj))
-                candidates.append(LogprobCandidate(token_id=int(token_id), token=getattr(logprob_obj, "decoded_token", None), logprob=logprob))
+                candidates.append(
+                    LogprobCandidate(
+                        token_id=int(token_id),
+                        token=getattr(
+                            logprob_obj,
+                            "decoded_token",
+                            None),
+                        logprob=logprob))
             rows.append(candidates)
         return rows
 
@@ -607,3 +882,20 @@ def _dtype_byte_size(dtype: str) -> int:
     if normalized in {"float32", "float", "auto"}:
         return 4
     return 4
+
+
+def _prompt_prefix_position(selector: Any, prompt_token_count: int) -> int | None:
+    if selector == "prompt":
+        return prompt_token_count - 1 if prompt_token_count > 0 else None
+    if isinstance(selector, int) and not isinstance(selector, bool):
+        return selector if 0 <= selector < prompt_token_count else None
+    if isinstance(selector, list):
+        if not selector:
+            return None
+        positions = []
+        for item in selector:
+            if not isinstance(item, int) or isinstance(item, bool) or item < 0 or item >= prompt_token_count:
+                return None
+            positions.append(item)
+        return max(positions)
+    return None

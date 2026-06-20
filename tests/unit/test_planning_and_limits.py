@@ -24,6 +24,7 @@ def test_schema_parsing_and_plan_resolution() -> None:
             ],
         }
     )
+    assert spec.hidden_states[0].capture_mode == "replay"
     plan = compile_extraction_plan(
         spec,
         num_layers=12,
@@ -34,6 +35,7 @@ def test_schema_parsing_and_plan_resolution() -> None:
     )
     assert plan.hidden_states[0]["layers"] == [0, 11]
     assert plan.hidden_states[0]["positions"] == [4]
+    assert plan.hidden_states[0]["capture_mode"] == "replay"
     assert plan.attentions[0]["layers"] == [4, 5, 6, 7]
     assert plan.attentions[0]["key_positions"] == {3: [2], 4: [3]}
 

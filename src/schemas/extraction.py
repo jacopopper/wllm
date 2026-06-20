@@ -14,6 +14,7 @@ PositionSelector: TypeAlias = int | list[int] | Literal["prompt", "generated", "
 AttentionKeySelector: TypeAlias = PositionSelector | Literal["previous_token"]
 HeadSelector: TypeAlias = int | list[int] | Literal["all"]
 PoolOp: TypeAlias = Literal["mean", "max", "last"] | None
+HiddenStateCaptureMode: TypeAlias = Literal["replay", "online"]
 
 
 class LogprobsExtraction(BaseModel):
@@ -32,6 +33,7 @@ class HiddenStateExtraction(BaseModel):
     layers: LayerSelector
     positions: PositionSelector
     pool: PoolOp = None
+    capture_mode: HiddenStateCaptureMode = "replay"
 
 
 class AttentionExtraction(BaseModel):
@@ -47,8 +49,15 @@ class ArtifactRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     format: Literal["npz", "pt"] = "npz"
+    compression: Literal["compressed", "uncompressed"] | None = None
     include: list[Literal["tokens", "logprobs", "hidden_states", "attentions"]] = Field(default_factory=list)
     allow_large: bool = False
+
+    @model_validator(mode="after")
+    def compression_matches_format(self) -> "ArtifactRequest":
+        if self.format != "npz" and self.compression is not None:
+            raise ValueError("artifact compression is supported only for npz artifacts")
+        return self
 
 
 class ExtractionSpec(BaseModel):

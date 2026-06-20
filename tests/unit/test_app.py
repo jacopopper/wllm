@@ -28,7 +28,8 @@ class FakeRuntime:
         return default_vllm_capabilities(self.model, "fake")
 
     def list_models(self) -> dict[str, Any]:
-        return {"object": "list", "data": [{"id": self.served_model_name, "object": "model", "created": 0, "owned_by": "wllm"}]}
+        return {"object": "list", "data": [{"id": self.served_model_name,
+                                            "object": "model", "created": 0, "owned_by": "wllm"}]}
 
     def generate_chat(self, request: ChatCompletionRequest) -> dict[str, Any]:
         self.chat_calls += 1
@@ -120,7 +121,8 @@ def test_generation_routes_are_sync_for_fastapi_threadpool() -> None:
 
 def test_completion_shape() -> None:
     _app, runtime = make_app()
-    body = completions(CompletionRequest.model_validate({"model": "fake-model", "prompt": "hi", "max_tokens": 4}), runtime=runtime)
+    body = completions(CompletionRequest.model_validate(
+        {"model": "fake-model", "prompt": "hi", "max_tokens": 4}), runtime=runtime)
     assert body["choices"][0]["text"] == "ok"
     assert body["usage"]["total_tokens"] == 2
 

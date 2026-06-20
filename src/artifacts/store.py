@@ -30,6 +30,7 @@ class ArtifactStore:
         trace_id: str,
         tensors: dict[str, Any],
         format: Literal["npz", "pt"] = "npz",
+        compression: Literal["compressed", "uncompressed"] | None = None,
     ) -> ArtifactManifest:
         context_trace_id = active_trace_id.get()
         if context_trace_id is not None and context_trace_id != trace_id:
@@ -44,11 +45,24 @@ class ArtifactStore:
         suffix = ".npz" if format == "npz" else ".pt"
         path = self._artifact_path(f"{artifact_id}{suffix}")
         _, capture_dtypes = _tensor_manifest_metadata(tensors)
+        compression_mode = compression or ("compressed" if format == "npz" else None)
         if format == "npz":
             normalized = {name: _to_numpy_array(value) for name, value in tensors.items()}
-            self._write_atomic(path, lambda temporary_path: save_npz(temporary_path, normalized))
+            self._write_atomic(
+                path,
+                lambda temporary_path: save_npz(
+                    temporary_path,
+                    normalized,
+                    compressed=compression_mode != "uncompressed",
+                ),
+            )
             shapes, dtypes = _tensor_manifest_metadata(normalized)
         elif format == "pt":
+            if compression is not None:
+                raise InvalidRequestError(
+                    "Artifact compression is supported only for npz artifacts.",
+                    param="extract.artifacts.compression",
+                )
             try:
                 normalized = self._write_atomic(path, lambda temporary_path: save_pt(temporary_path, tensors))
             except TorchArtifactUnavailableError as exc:
@@ -67,6 +81,7 @@ class ArtifactStore:
         return ArtifactManifest(
             artifact_id=artifact_id,
             format=format,
+            compression=compression_mode,
             path=path.relative_to(self.root).as_posix(),
             byte_size=len(data),
             sha256=hashlib.sha256(data).hexdigest(),

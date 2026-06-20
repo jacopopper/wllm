@@ -560,7 +560,12 @@ def test_failed_initialization_metadata_does_not_publish_partial_llm(monkeypatch
         SamplingParams = FakeSamplingParams
 
     monkeypatch.setattr(vllm_runtime_module, "import_vllm", lambda: Imports())
-    monkeypatch.setattr(vllm_runtime_module, "extract_model_topology", lambda _llm: (_ for _ in ()).throw(RuntimeError("metadata failed")))
+    monkeypatch.setattr(
+        vllm_runtime_module,
+        "extract_model_topology",
+        lambda _llm: (
+            _ for _ in ()).throw(
+            RuntimeError("metadata failed")))
     runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake"))
 
     try:
@@ -936,7 +941,8 @@ def test_hidden_only_extract_skips_token_decoding(tmp_path) -> None:
 
     trace = runtime.generate_extract(
         ExtractRequest.model_validate(
-            {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
+            {"model": "fake", "prompt": "hello", "extract": {
+                "hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
         ),
         limits=ResourceLimits(),
         artifact_store=ArtifactStore(tmp_path),
@@ -1285,7 +1291,8 @@ def test_generate_extract_uses_scoped_pooling_hooks_for_hidden_states(tmp_path) 
 
     trace = runtime.generate_extract(
         ExtractRequest.model_validate(
-            {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
+            {"model": "fake", "prompt": "hello", "extract": {
+                "hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
         ),
         limits=ResourceLimits(),
         artifact_store=ArtifactStore(tmp_path),
@@ -1407,7 +1414,8 @@ def test_generate_extract_uses_modern_pooling_runner_for_hidden_states(tmp_path,
 
     trace = runtime.generate_extract(
         ExtractRequest.model_validate(
-            {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
+            {"model": "fake", "prompt": "hello", "extract": {
+                "hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
         ),
         limits=ResourceLimits(),
         artifact_store=ArtifactStore(tmp_path),
@@ -1440,7 +1448,8 @@ def test_generate_extract_rejects_raw_hidden_capture_over_limit_before_pooling(t
     try:
         runtime.generate_extract(
             ExtractRequest.model_validate(
-                {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
+                {"model": "fake", "prompt": "hello", "extract": {
+                    "hidden_states": [{"layers": -1, "positions": "last_generated"}]}}
             ),
             limits=ResourceLimits(max_total_captured_tensor_bytes=255, max_inline_tensor_bytes=10_000),
             artifact_store=ArtifactStore(tmp_path),
@@ -1466,7 +1475,8 @@ def test_generate_extract_supports_middle_layer_with_scoped_pooling_hooks(tmp_pa
 
     trace = runtime.generate_extract(
         ExtractRequest.model_validate(
-            {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": "middle", "positions": "last"}]}}
+            {"model": "fake", "prompt": "hello", "extract": {
+                "hidden_states": [{"layers": "middle", "positions": "last"}]}}
         ),
         limits=ResourceLimits(),
         artifact_store=ArtifactStore(tmp_path),
@@ -1492,7 +1502,8 @@ def test_generate_extract_rejects_hidden_states_with_tensor_parallelism(tmp_path
     try:
         runtime.generate_extract(
             ExtractRequest.model_validate(
-                {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": "middle", "positions": "last"}]}}
+                {"model": "fake", "prompt": "hello", "extract": {
+                    "hidden_states": [{"layers": "middle", "positions": "last"}]}}
             ),
             limits=ResourceLimits(),
             artifact_store=ArtifactStore(tmp_path),
@@ -1621,7 +1632,8 @@ def test_generate_extract_rejects_hidden_states_with_high_gpu_memory_utilization
     try:
         runtime.generate_extract(
             ExtractRequest.model_validate(
-                {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": "middle", "positions": "last"}]}}
+                {"model": "fake", "prompt": "hello", "extract": {
+                    "hidden_states": [{"layers": "middle", "positions": "last"}]}}
             ),
             limits=ResourceLimits(),
             artifact_store=ArtifactStore(tmp_path),
@@ -1649,7 +1661,8 @@ def test_replay_hidden_states_still_require_replay_capacity_when_online_is_enabl
     with pytest.raises(UnsupportedExtractionError) as exc:
         runtime.generate_extract(
             ExtractRequest.model_validate(
-                {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": "middle", "positions": "last"}]}}
+                {"model": "fake", "prompt": "hello", "extract": {
+                    "hidden_states": [{"layers": "middle", "positions": "last"}]}}
             ),
             limits=ResourceLimits(),
             artifact_store=ArtifactStore(tmp_path),
@@ -1676,7 +1689,8 @@ def test_replay_hidden_states_still_require_pooling_runner_when_online_is_enable
     with pytest.raises(UnsupportedExtractionError) as exc:
         runtime.generate_extract(
             ExtractRequest.model_validate(
-                {"model": "fake", "prompt": "hello", "extract": {"hidden_states": [{"layers": "middle", "positions": "last"}]}}
+                {"model": "fake", "prompt": "hello", "extract": {
+                    "hidden_states": [{"layers": "middle", "positions": "last"}]}}
             ),
             limits=ResourceLimits(),
             artifact_store=ArtifactStore(tmp_path),

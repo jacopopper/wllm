@@ -4,8 +4,12 @@ wllm-stress-artifacts/
 
 # Local benchmark harness and generated reports
 scripts/stress_wllm_vs_vllm.py
+scripts/compare_online_vs_replay_hidden_states.py
 reports/*stress*.json
 reports/*stress*.md
+reports/wllm_online_vs_replay_*.json
+reports/wllm_online_vs_replay_*.md
+reports/wllm_online_vs_replay_artifacts/
 
 # Build outputs
 dist/

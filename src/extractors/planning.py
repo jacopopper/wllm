@@ -150,7 +150,7 @@ def _compile(
                 limits=limits,
                 reason="Full hidden-state dumps must be artifact-backed and explicitly enabled.",
             )
-        item = {"layers": layers, "positions": positions, "pool": hidden.pool}
+        item = {"layers": layers, "positions": positions, "pool": hidden.pool, "capture_mode": hidden.capture_mode}
         hidden_metadata.append(item)
         plan.hidden_states.append(item)
 
@@ -197,7 +197,8 @@ def _compile(
             param=f"extract.attentions[{index}].query_positions",
             limits=limits,
         )
-        if len(layers) == num_layers and heads == "all" and len(query_positions) == prompt_token_count + generated_token_count:
+        if len(layers) == num_layers and heads == "all" and len(
+                query_positions) == prompt_token_count + generated_token_count:
             _require_large_extraction(
                 spec,
                 tensor_name="attentions",

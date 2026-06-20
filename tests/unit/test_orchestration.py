@@ -18,17 +18,26 @@ from server.errors import InvalidRequestError, ResourceLimitError, UnsupportedEx
 def make_inputs() -> GeneratedTraceInputs:
     return GeneratedTraceInputs(
         model="fake",
-        generation={"id": "cmpl_1", "choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}},
+        generation={
+            "id": "cmpl_1",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 2,
+                "total_tokens": 4}},
         prompt_token_ids=[10, 11],
         generated_token_ids=[12, 13],
         decoded_tokens=["a", "b", "c", "d"],
         prompt_logprobs=[
             [],
-            [LogprobCandidate(token_id=11, token="b", logprob=-0.3), LogprobCandidate(token_id=77, token="z", logprob=-2.3)],
+            [LogprobCandidate(token_id=11, token="b", logprob=-0.3),
+             LogprobCandidate(token_id=77, token="z", logprob=-2.3)],
         ],
         generated_logprobs=[
-            [LogprobCandidate(token_id=12, token="c", logprob=-0.2), LogprobCandidate(token_id=99, token="x", logprob=-2.0)],
-            [LogprobCandidate(token_id=13, token="d", logprob=-0.1), LogprobCandidate(token_id=88, token="y", logprob=-3.0)],
+            [LogprobCandidate(token_id=12, token="c", logprob=-0.2),
+             LogprobCandidate(token_id=99, token="x", logprob=-2.0)],
+            [LogprobCandidate(token_id=13, token="d", logprob=-0.1),
+             LogprobCandidate(token_id=88, token="y", logprob=-3.0)],
         ],
         generation_ms=7.5,
         topology=RuntimeTopology(num_layers=12, num_attention_heads=8, hidden_size=32),
@@ -317,7 +326,8 @@ def test_prompt_logprob_artifacts_are_written_when_requested(tmp_path) -> None:
 
 
 def test_orchestrator_rejects_exact_entropy_without_complete_distribution() -> None:
-    request = ExtractRequest.model_validate({"model": "fake", "prompt": "hello", "extract": {"logprobs": {"entropy": True}}})
+    request = ExtractRequest.model_validate(
+        {"model": "fake", "prompt": "hello", "extract": {"logprobs": {"entropy": True}}})
     orchestrator = ExtractionOrchestrator(default_vllm_capabilities("fake", "fake"))
     with pytest.raises(UnsupportedExtractionError) as exc:
         orchestrator.preflight(request, ResourceLimits())
@@ -509,7 +519,8 @@ def test_hidden_state_records_can_be_artifact_backed(tmp_path) -> None:
     assert record.artifact_id == trace.artifacts[0].artifact_id
     assert trace.artifacts[0].tensor_shapes["hidden_states_0"] == [1, 2, 32]
     tensors = load_artifact(tmp_path, trace.artifacts[0])
-    assert np.array_equal(tensors["hidden_states_0"][0, :, :3], np.asarray([[64, 65, 66], [96, 97, 98]], dtype=np.float32))
+    assert np.array_equal(tensors["hidden_states_0"][0, :, :3], np.asarray(
+        [[64, 65, 66], [96, 97, 98]], dtype=np.float32))
 
 
 def test_hidden_state_request_fails_when_runtime_did_not_capture_layer(tmp_path) -> None:

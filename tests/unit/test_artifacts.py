@@ -452,6 +452,22 @@ def test_pt_roundtrip_int64_float16(tmp_path) -> None:
 # Trace bundle: dict manifest, digest, path traversal, typed trace
 # ---------------------------------------------------------------------------
 
+_TRACE_PAYLOAD = {
+    "schema_version": "wllm.trace.v1",
+    "id": "trace_1",
+    "object": "wllm.trace",
+    "created": 1234567890,
+    "model": "test",
+    "generation": {
+        "choices": [],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    },
+    "trace": {
+        "tokens": {}, "spans": {}, "logprobs": {},
+        "hidden_states": [], "attentions": [],
+    },
+}
+
 
 def test_load_trace_bundle_accepts_dict_manifest(tmp_path) -> None:
     from tracing.serialization import load_trace_bundle
@@ -460,10 +476,7 @@ def test_load_trace_bundle_accepts_dict_manifest(tmp_path) -> None:
     manifest = store.put_trace_bundle(
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
-        payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {"choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                  "trace": {"tokens": {}, "spans": {}, "logprobs": {}, "hidden_states": [], "attentions": []}},
+        payload=_TRACE_PAYLOAD,
     )
     trace_model = load_trace_bundle(tmp_path, manifest)
     trace_dict = load_trace_bundle(tmp_path, manifest.model_dump(mode="json"))
@@ -478,10 +491,7 @@ def test_load_trace_bundle_rejects_digest_mismatch(tmp_path) -> None:
     manifest = store.put_trace_bundle(
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
-        payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {"choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                  "trace": {"tokens": {}, "spans": {}, "logprobs": {}, "hidden_states": [], "attentions": []}},
+        payload=_TRACE_PAYLOAD,
     )
     manifest = manifest.model_copy(update={"sha256": "0" * 64})
 
@@ -496,10 +506,7 @@ def test_load_trace_bundle_rejects_path_traversal(tmp_path) -> None:
     manifest = store.put_trace_bundle(
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
-        payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {"choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                  "trace": {"tokens": {}, "spans": {}, "logprobs": {}, "hidden_states": [], "attentions": []}},
+        payload=_TRACE_PAYLOAD,
     )
     manifest = manifest.model_copy(update={"path": "../escape.json"})
 
@@ -515,10 +522,7 @@ def test_load_trace_bundle_returns_typed_trace(tmp_path) -> None:
     manifest = store.put_trace_bundle(
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
-        payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {"choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                  "trace": {"tokens": {}, "spans": {}, "logprobs": {}, "hidden_states": [], "attentions": []}},
+        payload=_TRACE_PAYLOAD,
     )
     trace = load_trace_bundle(tmp_path, manifest)
     assert isinstance(trace, TraceEnvelope)
@@ -535,13 +539,11 @@ def test_load_trace_bundle_rejects_trace_id_mismatch(tmp_path) -> None:
     from tracing.serialization import TraceLoadError, load_trace_bundle
 
     store = ArtifactStore(tmp_path)
+    bad_payload = {**_TRACE_PAYLOAD, "id": "wrong_trace_id"}
     manifest = store.put_trace_bundle(
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
-        payload={"schema_version": "wllm.trace.v1", "id": "wrong_trace_id", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {"choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                  "trace": {"tokens": {}, "spans": {}, "logprobs": {}, "hidden_states": [], "attentions": []}},
+        payload=bad_payload,
     )
 
     with pytest.raises(TraceLoadError, match="Trace ID mismatch"):
@@ -555,10 +557,7 @@ def test_load_trace_bundle_rejects_schema_version_mismatch(tmp_path) -> None:
     manifest = store.put_trace_bundle(
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
-        payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {"choices": [], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-                  "trace": {"tokens": {}, "spans": {}, "logprobs": {}, "hidden_states": [], "attentions": []}},
+        payload=_TRACE_PAYLOAD,
     )
     # Tamper the manifest's schema_version so it differs from the payload
     manifest = manifest.model_copy(update={"schema_version": "wllm.trace.v99"})
@@ -575,8 +574,8 @@ def test_load_trace_bundle_rejects_invalid_utf8(tmp_path) -> None:
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
         payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {}, "trace": {}},
+                 "created": 1234567890, "model": "test",
+                 "generation": {}, "trace": {}},
     )
     # Write invalid UTF-8 bytes and update manifest
     bad_bytes = b'\x80\x81\x82'
@@ -598,8 +597,8 @@ def test_load_trace_bundle_rejects_invalid_json(tmp_path) -> None:
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
         payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {}, "trace": {}},
+                 "created": 1234567890, "model": "test",
+                 "generation": {}, "trace": {}},
     )
     # Write non-JSON content and update manifest
     bad_text = "this is not json"
@@ -622,8 +621,8 @@ def test_load_trace_bundle_rejects_invalid_schema(tmp_path) -> None:
         trace_id="trace_1",
         schema_version="wllm.trace.v1",
         payload={"schema_version": "wllm.trace.v1", "id": "trace_1", "object": "wllm.trace",
-                  "created": 1234567890, "model": "test",
-                  "generation": {}, "trace": {}},
+                 "created": 1234567890, "model": "test",
+                 "generation": {}, "trace": {}},
     )
     # Write valid JSON that is not a valid TraceEnvelope (missing required top-level fields)
     bad_payload = '{"not": "a", "valid": "trace"}'

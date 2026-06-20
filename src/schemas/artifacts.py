@@ -14,6 +14,7 @@ class ArtifactTensorInfo(BaseModel):
 class ArtifactManifest(BaseModel):
     artifact_id: str
     format: Literal["npz", "pt"]
+    compression: Literal["compressed", "uncompressed"] | None = None
     path: str
     byte_size: int = Field(ge=0)
     sha256: str

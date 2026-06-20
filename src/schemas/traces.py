@@ -20,6 +20,10 @@ class TensorRecord(BaseModel):
     positions: list[int] | None = None
     heads: list[int] | None = None
     capture_site: str
+    capture_mode: Literal["replay", "online"] | None = None
+    capture_phase: str | None = None
+    position_semantics: dict[str, Any] = Field(default_factory=dict)
+    capture_metadata: dict[str, Any] = Field(default_factory=dict)
     data: Any | None = None
     artifact_id: str | None = None
     byte_size: int | None = None
@@ -52,6 +56,7 @@ class TraceMetadata(BaseModel):
     sampling: dict[str, Any] = Field(default_factory=dict)
     resolved_selectors: dict[str, Any] = Field(default_factory=dict)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    capture: dict[str, Any] = Field(default_factory=dict)
     timing_ms: TimingMetadata = Field(default_factory=TimingMetadata)
 
 

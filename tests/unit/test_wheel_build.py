@@ -50,7 +50,8 @@ def test_wheel_contains_all_flat_layout_packages(built_wheel) -> None:
         assert any(n.startswith(pkg + "/") for n in names), f"missing flat package: {pkg}/"
 
     # No src/wllm/ directory, no nested wllm package, no src/ prefix at all
-    assert not any(n.startswith("src/") for n in names), f"src/ paths leaked into wheel: {[n for n in names if n.startswith('src/')]}"
+    assert not any(n.startswith("src/")
+                   for n in names), f"src/ paths leaked into wheel: {[n for n in names if n.startswith('src/')]}"
     assert not any(n.startswith("wllm/") for n in names), "nested wllm/ package found in wheel"
 
     # Wheel metadata present
