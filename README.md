@@ -277,19 +277,64 @@ tensors = load_artifact("./wllm-artifacts", {
 
 `load_artifact` validates SHA-256 digest integrity and rejects path traversal attempts. It accepts both `ArtifactManifest` model instances and plain dicts.
 
+## Trace-to-Artifact Mapping
+
+When a trace is persisted via `/v1/traces`, the response connects trace metadata to on-disk artifact files:
+
+```
+/v1/traces response
+├── trace_manifest          ──→  traces/<trace_id>/trace_bundle.json
+│   ├── trace_id                              (full TraceEnvelope JSON)
+│   ├── byte_size / sha256                    (validated on load)
+│   └── schema_version                        (must equal "wllm.trace.v1")
+│
+└── artifacts[]             ──→  traces/<trace_id>/hidden_states_000.npz
+    ├── path                                 (e.g., traces/<trace_id>/logprobs_000.npz)
+    ├── format / byte_size / sha256           (validated on load)
+    ├── tensor_shapes / tensor_dtypes          (per-tensor metadata)
+    └── included_tensor_names                  (which extraction data is included)
+```
+
+Key relationships:
+- The `trace_manifest` is a `TraceBundleManifest` that references the persisted JSON file. Use `load_trace_bundle(root, trace_manifest)` to load the full `TraceEnvelope`.
+- Each entry in `artifacts` is an `ArtifactManifest` that references an on-disk NPZ or PT file. Use `load_artifact(root, artifact_manifest)` to load tensor data.
+- Both manifests carry SHA-256 digests and byte sizes that are verified on every load.
+- The trace ID ties artifacts back to their originating request: artifact paths are under `traces/<trace_id>/`.
+
+The `/v1/extract` endpoint (non-persisting) returns the same `TraceEnvelope` shape inline, with `trace_manifest` null/absent and `artifacts` empty.
+
+### One-liner loaders
+
+```python
+# Load a trace bundle from its manifest (one call)
+trace = load_trace_bundle("./wllm-artifacts", response["trace_manifest"])
+
+# Load an artifact from its manifest (one call)
+tensors = load_artifact("./wllm-artifacts", response["artifacts"][0])
+
+# Load all artifacts for a trace
+all_tensors = {a["path"]: load_artifact("./wllm-artifacts", a) for a in response["artifacts"]}
+
+# Load a trace bundle from a plain dict manifest
+trace = load_trace_bundle("./wllm-artifacts", {"path": "traces/abc/trace_bundle.json", "sha256": "...", "byte_size": 1234, "schema_version": "wllm.trace.v1", "trace_id": "abc"})
+```
+
 ## Dataset-Building Workflow
 
 A typical researcher workflow: prompt dataset → extract traces → load artifacts → run analysis.
 
+See `scripts/dataset_workflow.py` for a full runnable example with CLI flags and error handling.
+
 ```python
 import json
-from openai import OpenAI
+import httpx
 from artifacts import load_artifact
 from tracing.serialization import load_trace_bundle
 from research.token_baselines import TokenBaselineAdapter
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+client = httpx.Client(base_url="http://localhost:8000/v1", timeout=60)
 ARTIFACT_DIR = "./wllm-artifacts"
+MODEL = "Qwen/Qwen3-0.6B"
 
 # 1. Read prompts from a JSONL dataset
 with open("prompts.jsonl") as f:
@@ -298,9 +343,9 @@ with open("prompts.jsonl") as f:
 # 2. Extract traces for each prompt
 for i, prompt in enumerate(prompts):
     resp = client.post(
-        "/v1/traces",
+        "/traces",
         json={
-            "model": "Qwen/Qwen3-0.6B",
+            "model": MODEL,
             "prompt": prompt,
             "max_tokens": 64,
             "extract": {
@@ -311,12 +356,13 @@ for i, prompt in enumerate(prompts):
             },
         },
     )
+    resp.raise_for_status()
     trace_resp = resp.json()
 
-    # 3. Load the persisted trace bundle
+    # 3. Load the persisted trace bundle (one-liner)
     trace = load_trace_bundle(ARTIFACT_DIR, trace_resp["trace_manifest"])
 
-    # 4. Load artifact tensors
+    # 4. Load artifact tensors (one-liners)
     tensors = {
         manifest["path"]: load_artifact(ARTIFACT_DIR, manifest)
         for manifest in trace_resp.get("artifacts", [])
@@ -325,9 +371,11 @@ for i, prompt in enumerate(prompts):
     # 5. Run a research adapter
     result = TokenBaselineAdapter().run(trace)
     print(f"[{i}] {prompt[:40]}... → {result.values}")
+
+client.close()
 ```
 
-All adapters (TokenBaseline, RAUQ, EigenScore, ActMap) consume the generic `TraceEnvelope` and artifact tensors. They do not define server routes or paper-specific request fields.
+All adapters (TokenBaseline, RAUQ, EigenScore, ActMap) consume the generic `TraceEnvelope` and artifact tensors. They define no server routes or paper-specific request fields.
 
 ## Trace Schema
 
