@@ -4,42 +4,36 @@
 
 wllm is an OpenAI-compatible inference server with a generic, versioned white-box extraction API over vLLM. Normal generation stays trace-free by default; extraction is enabled only through `/v1/extract` or `/v1/traces`.
 
-## Status
+## Release Status
 
-Implemented:
+**Version 0.1.0** — initial release.
 
-- Flat `src/` layout with no `src/wllm/` package.
-- `wllm` CLI with lazy vLLM imports.
-- Non-streaming `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/completions`.
-- Generic `POST /v1/extract`, `POST /v1/traces`, and `GET /v1/extraction-schema`.
-- Versioned schemas: `wllm.extraction.v1` and `wllm.trace.v1`.
-- Selector normalization for layers, positions, attention `previous_token`, and hidden-state pooling metadata.
-- Request-scoped collector registry used by tests for cleanup and isolation semantics.
-- Conservative resource limits and OpenAI-style error envelopes.
-- `.npz` and conditional `.pt` artifact storage with SHA-256 manifests and path traversal protection.
-- Optional research adapter protocol under `src/research/`; paper-specific terms are not part of the server API.
+- **353 unit tests pass** (no GPU/vLLM required).
+- **4 integration tests** (smoke: token/logprob, replay HS, online HS, repeated replay) require GPU + vLLM + local model.
+- **3 model architectures validated**: Qwen3, Llama, Mistral (see Capability Matrix below).
+- **1 benchmarked configuration**: Qwen3-0.6B on RTX 5090 (24 GB), vLLM 0.10.2.
 
-Capability-gated:
+This release is suitable for researchers who want to prototype extraction workflows on small-to-medium models (up to ~6B parameters for hidden-state replay). Production deployments and streaming are not supported. See Known Limitations.
 
-- Token IDs and bounded top-k generated-token logprobs are supported through vLLM generation outputs.
-- Prompt logprobs are opt-in with `extract.logprobs.include_prompt=true` when the active vLLM `SamplingParams` supports `prompt_logprobs`.
-- Raw logits are unsupported because the public vLLM generation output exposes logprobs, not logits.
-- Exact entropy is unsupported unless a future runtime path exposes the complete distribution. Approximate entropy can be explicitly requested from renormalized top-k logprobs.
-- Selected transformer-block token hidden states are conditionally supported for models whose vLLM configuration advertises the `pooling` runner and runs with `tensor_parallel_size=1`. wllm runs the completed token sequence through an isolated vLLM pooling runner with temporary scoped hooks and records the capture site as `transformer_block_output`.
-- Tensor-parallel hidden-state capture remains unsupported until aggregation of sharded intermediate activations is implemented. The normal serving runner never receives hooks.
-- Attention weights are reported unsupported when the active vLLM path or fused attention backend does not expose them.
+## What wllm Is
 
-Performance posture:
+- An **OpenAI-compatible inference server** exposing `/v1/models`, `/v1/chat/completions`, and `/v1/completions`.
+- A **white-box extraction API** (`/v1/extract`, `/v1/traces`) for token IDs, logprobs, and hidden states with versioned schemas.
+- A **drop-in replacement** for common non-streaming `vllm serve MODEL` workflows, accepting a focused subset of vLLM CLI options.
+- **Extraction-free by default**: normal generation creates no collectors, hooks, or artifacts.
 
-- Server orchestration, schemas, planning, tracing, and artifact handling are implemented in Python.
-- The generation hot path stays inside vLLM. Normal OpenAI-compatible requests do not build extraction plans, collectors, or artifacts.
-- Extraction postprocessing uses NumPy/PyTorch-compatible dense arrays for artifact data instead of doing Python work inside token-level generation loops.
-- Native code is not introduced speculatively. For GPU-bound extraction kernels, Triton is preferred after profiling shows a real bottleneck; PyTorch C++/CUDA custom operators are reserved for cases where Triton and existing vLLM/PyTorch primitives are insufficient.
-- Server components are not rewritten in C or Rust for speculative performance gains.
+## What wllm Is Not
+
+- **Not a streaming server.** `stream=true` is explicitly rejected on all endpoints.
+- **Not a complete vLLM reimplementation.** Unsupported vLLM options (quantization, LoRA, speculative decoding, multimodal, etc.) are rejected.
+- **Not a model training or fine-tuning framework.**
+- **Not a replacement for vLLM's full feature set.** It targets AI safety research workflows that need runtime model internals alongside standard serving.
 
 ## Installation
 
-For unit tests and API shape work:
+Requires Python 3.10 or newer.
+
+For unit tests and API shape work (no GPU/vLLM needed):
 
 ```bash
 pip install -e '.[test]'
@@ -51,9 +45,7 @@ For production vLLM serving:
 pip install -e '.[vllm]'
 ```
 
-Supported Python: 3.10 or newer.
-
-Validated vLLM version: `0.10.2`. The production `vllm` extra installs `vllm==0.10.2`, and the runtime rejects other vLLM versions with a structured `503` instead of guessing private API paths.
+**Supported vLLM version:** `0.10.2` (exact match enforced at runtime). The production `vllm` extra installs `vllm==0.10.2`. The runtime rejects other vLLM versions with a structured HTTP 503 error.
 
 ## Layout
 
@@ -72,20 +64,20 @@ tests/
   integration/
 ```
 
-## Start The Server
+## Start the Server
 
 ```bash
 wllm serve Qwen/Qwen3-0.6B --local-files-only
 ```
 
-Useful options:
+Accepts both HuggingFace IDs and local filesystem paths. Full option list:
 
 ```text
---host
---port
---dtype
---tensor-parallel-size
---gpu-memory-utilization
+--host                  (default: 127.0.0.1)
+--port                  (default: 8000)
+--dtype                 (default: auto)
+--tensor-parallel-size  (default: 1)
+--gpu-memory-utilization (default: 0.9)
 --max-model-len
 --tokenizer
 --served-model-name
@@ -93,29 +85,64 @@ Useful options:
 --seed
 --trust-remote-code
 --local-files-only
---artifact-dir
---log-level
+--prewarm-hidden-states
+--enable-online-hidden-states
+--artifact-dir          (default: ./wllm-artifacts)
+--log-level             (default: info, choices: debug/info/warning/error)
 ```
 
-`--served-model-name` changes the model name returned by `GET /v1/models` and in generation responses. If omitted, the loaded model name is used.
+Key options:
 
-`--api-key` requires an `Authorization` header (Bearer token or bare token) on every request.
+- `--served-model-name`: changes the model name in `/v1/models` and generation responses.
+- `--api-key`: requires an `Authorization` header (Bearer token or bare token) on every request.
+- `--local-files-only`: sets `HF_HUB_OFFLINE=1` and related env vars before vLLM init. Fails with a structured error if model files are missing, rather than downloading.
+- `--prewarm-hidden-states`: initializes the isolated pooling runner at startup instead of on the first hidden-state request (~3.3s cold start avoided).
+- `--enable-online-hidden-states`: enables `capture_mode="online"` for hidden states. Starts the generation runner in eager in-process mode, which changes generation performance.
+- `--artifact-dir`: directory for persisted traces and NPZ/PT artifacts.
 
-`--local-files-only` sets Hugging Face offline environment flags before vLLM initialization. If files are missing locally, server startup fails with a structured runtime error instead of silently downloading model files.
+## Standard OpenAI Client Usage
 
-`--max-model-len`, `--tokenizer`, and `--seed` are passed to vLLM when supported by the active vLLM version. Unsupported sampling or constructor parameters are rejected with a structured error rather than silently ignored.
+wllm is compatible with the standard `openai` Python library. Point the client at your wllm server:
 
-## Compatibility with `vllm serve`
+```python
+from openai import OpenAI
 
-wllm is a drop-in replacement for **common** vLLM OpenAI serving workflows, not a complete reimplementation of `vllm serve`. It intentionally accepts a focused subset of vLLM options and adds `--artifact-dir`, `--api-key`, and `--served-model-name`.
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed",  # or your --api-key value
+)
 
-Supported common options: `--host`, `--port`, `--dtype`, `--tensor-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`, `--tokenizer`, `--served-model-name`, `--api-key`, `--seed`, `--trust-remote-code`, `--local-files-only`.
+# Chat completion
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-0.6B",
+    messages=[{"role": "user", "content": "Say hello."}],
+    max_tokens=16,
+)
+print(response.choices[0].message.content)
 
-Known unsupported vLLM options include: `--quantization`, `--kv-cache-dtype`, `--device`, `--load-format`, `--config-format`, `--worker-use-ray`, `--pipeline-parallel-size`, `--enable-prefix-caching`, `--speculative-model`, `--num-scheduler-steps`, `--multi-step-stream-outputs`, `--allowed-local-media-path`, `--conversation-template`, `--enable-auto-tool-choice`, `--tool-call-parser`, `--chat-template`, `--chat-template-content-format`, `--enable-reasoning`, `--reasoning-parser`, `--lora-modules`, `--prompt-adapters`, `--max-logprobs`, `--disable-log-stats`, `--use-v2-block-manager`, `--enable-prompt-span`, `--enable-chunked-prefill`, `--embedding-mode`, `--swap-space`, `--max-num-batched-tokens`, `--max-num-seqs`, `--generation-config`, `--model-loader-extra-config`, `--ignore-patterns`, `--preemption-mode`, `--scheduler-delay-factor`, `--enable-torch-compile`, `--torchcompile-max-bs`, `--distributed-executor-backend`, `--max-local-adapters`, `--model-impl`, `--enable-async-output-proc`, `--enable-p2p-check`, `--enable-kv-transfer`, `--kv-transfer-config`, and options related to disaggregated serving, multimodal inputs, tool calling, structured outputs, and quantization.
+# Text completion
+response = client.completions.create(
+    model="Qwen/Qwen3-0.6B",
+    prompt="Say hello:",
+    max_tokens=16,
+)
+print(response.choices[0].text)
 
-Unsupported options are rejected by the CLI parser or, if they map to vLLM constructor/sampling parameters, by runtime validation with a structured error.
+# List models
+models = client.models.list()
+for m in models.data:
+    print(m.id)
+```
 
-## OpenAI-Compatible Requests
+## Non-Streaming Limitation
+
+**wllm 0.1.0 does not implement streaming.** Setting `stream=true` on any endpoint (`/v1/chat/completions`, `/v1/completions`, `/v1/extract`, `/v1/traces`) returns HTTP 422 with:
+
+```json
+{"error": {"message": "Streaming ... is not implemented.", "code": "streaming_not_implemented", "type": "invalid_request_error", "param": "stream"}}
+```
+
+## Normal Generation (curl)
 
 Chat:
 
@@ -133,11 +160,9 @@ curl http://localhost:8000/v1/completions \
   -d '{"model":"Qwen/Qwen3-0.6B","prompt":"Say hello:","max_tokens":16}'
 ```
 
-Streaming is not implemented in this initial server and is rejected explicitly when `stream=true`. Sampling fields are translated to vLLM `SamplingParams`; explicitly requested sampling fields that the active vLLM version does not support are rejected with a structured `422` error instead of being silently ignored.
+Normal generation requests go directly through vLLM without building extraction plans, collectors, hooks, or artifacts. Sampling fields (`temperature`, `top_p`, `top_k`, `stop`, `n`, `seed`, `presence_penalty`, `frequency_penalty`, `logprobs`) are translated to vLLM `SamplingParams`. Unsupported sampling fields are rejected with a structured 422 error.
 
-## Extraction Requests
-
-Bounded inline token and logprob extraction:
+## Token & Logprob Extraction
 
 ```bash
 curl http://localhost:8000/v1/extract \
@@ -150,7 +175,57 @@ curl http://localhost:8000/v1/extract \
   }'
 ```
 
-Persisted trace request:
+This returns a `wllm.trace.v1` response with:
+- `trace.tokens.token_ids` — exact integer token IDs from vLLM generation.
+- `trace.tokens.tokens` — decoded token strings.
+- `trace.logprobs.generated` — per-token logprobs with top-k alternatives.
+- `trace.logprobs.prompt` — prompt-token logprob rows (when `include_prompt=true`).
+
+Token/logprob extraction is verified by integration tests and 353 unit tests. Approximate entropy is available via `extract.logprobs.entropy=true` with `allow_approximate_entropy=true`, computed from renormalized top-k logprobs.
+
+## Hidden-State Replay & Extraction
+
+Replay mode (default) captures hidden states after generation using an isolated vLLM pooling runner:
+
+```bash
+curl http://localhost:8000/v1/extract \
+  -H 'content-type: application/json' \
+  -d '{
+    "model":"Qwen/Qwen3-0.6B",
+    "prompt":"Explain how transformer blocks process information.",
+    "max_tokens":32,
+    "extract":{
+      "hidden_states":[
+        {"layers":"middle_third","positions":"generated","pool":"mean"}
+      ]
+    }
+  }'
+```
+
+Requirements: `tensor_parallel_size=1`, `gpu_memory_utilization <= 0.5`.
+
+Online capture mode (opt-in via `--enable-online-hidden-states`) captures during generation:
+
+```bash
+curl http://localhost:8000/v1/extract \
+  -H 'content-type: application/json' \
+  -d '{
+    "model":"Qwen/Qwen3-0.6B",
+    "prompt":"Explain how transformer blocks process information.",
+    "max_tokens":32,
+    "extract":{
+      "hidden_states":[
+        {"layers":"middle","positions":"prompt","capture_mode":"online"}
+      ]
+    }
+  }'
+```
+
+**Important**: Online hidden states are not numerically interchangeable with replay-mode hidden states (benchmarked relative L2 error up to 1.26, max absolute divergence 13.56 in tested cases). Use the appropriate capture mode for your research question. Online mode uses predictor/source position p-1 for generated-token selectors.
+
+## Artifact Export
+
+Request NPZ artifact output alongside the trace:
 
 ```bash
 curl http://localhost:8000/v1/traces \
@@ -159,69 +234,324 @@ curl http://localhost:8000/v1/traces \
     "model":"Qwen/Qwen3-0.6B",
     "prompt":"Summarize uncertainty:",
     "max_tokens":32,
-    "extract":{"tokens":true,"logprobs":{"top_k":5},"artifacts":{"format":"npz","include":["logprobs"]}}
+    "extract":{
+      "tokens":true,
+      "logprobs":{"top_k":5},
+      "hidden_states":[{"layers":"middle_third","positions":"generated"}],
+      "artifacts":{"format":"npz","include":["logprobs","hidden_states"]}
+    }
   }'
 ```
 
-`/v1/extract` returns generation plus bounded extraction results inline when available. `/v1/traces` uses the same request schema, writes a normalized JSON trace bundle, and returns a `trace_manifest` with the bundle path, byte size, SHA-256 digest, creation time, and trace ID. Tensor artifacts requested through `extract.artifacts` are written separately.
+NPZ is compressed by default. For lower serialization latency at the cost of larger files, use uncompressed:
 
-`GET /v1/extraction-schema` returns `wllm.extraction.v1`, the live Pydantic JSON schema for extraction requests, selector semantics, configured resource limits, and runtime capabilities.
-When vLLM exposes or configures an attention backend, capability metadata includes `attention_backend` and echoes it in the attention capability details.
-Hidden-state capability metadata reports whether the loaded model advertises a vLLM `pooling` runner and whether the worker configuration is single-rank. Without that runner, with tensor parallelism enabled, with `gpu_memory_utilization > 0.5`, or without runtime `hidden_size` metadata for capture-size enforcement, hidden-state extraction returns `hidden_states_unavailable`.
+```json
+"artifacts":{"format":"npz","compression":"uncompressed","include":["hidden_states"]}
+```
+
+PT format is also supported:
+
+```json
+"artifacts":{"format":"pt","include":["hidden_states"]}
+```
+
+All artifacts include SHA-256 digests, byte sizes, tensor shapes/dtypes, and capture/storage dtype metadata in their manifests. bf16 tensors are converted to float32 for NPZ with `capture_dtype="torch.bfloat16"` and `storage_dtype="float32"` recorded.
+
+## Artifact Loading
+
+Load artifacts from disk using the manifest returned in `/v1/traces` responses:
+
+```python
+from artifacts import load_artifact
+
+# Load a single artifact by its manifest
+tensors = load_artifact("./wllm-artifacts", trace_response["artifacts"][0])
+
+# Or load by manifest dict
+tensors = load_artifact("./wllm-artifacts", {
+    "path": "traces/abc123/hidden_states_000.npz",
+    "sha256": "a1b2c3...",
+    "format": "npz",
+})
+```
+
+`load_artifact` validates SHA-256 digest integrity and rejects path traversal attempts. It accepts both `ArtifactManifest` model instances and plain dicts.
+
+## Dataset-Building Workflow
+
+A typical researcher workflow: prompt dataset → extract traces → load artifacts → run analysis.
+
+```python
+import json
+from openai import OpenAI
+from artifacts import load_artifact
+from tracing.serialization import load_trace_bundle
+from research.token_baselines import TokenBaselineAdapter
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+ARTIFACT_DIR = "./wllm-artifacts"
+
+# 1. Read prompts from a JSONL dataset
+with open("prompts.jsonl") as f:
+    prompts = [json.loads(line)["prompt"] for line in f]
+
+# 2. Extract traces for each prompt
+for i, prompt in enumerate(prompts):
+    resp = client.post(
+        "/v1/traces",
+        json={
+            "model": "Qwen/Qwen3-0.6B",
+            "prompt": prompt,
+            "max_tokens": 64,
+            "extract": {
+                "tokens": True,
+                "logprobs": {"top_k": 5, "include_prompt": True},
+                "hidden_states": [{"layers": "middle", "positions": "last_generated"}],
+                "artifacts": {"format": "npz", "include": ["logprobs", "hidden_states"]},
+            },
+        },
+    )
+    trace_resp = resp.json()
+
+    # 3. Load the persisted trace bundle
+    trace = load_trace_bundle(ARTIFACT_DIR, trace_resp["trace_manifest"])
+
+    # 4. Load artifact tensors
+    tensors = {
+        manifest["path"]: load_artifact(ARTIFACT_DIR, manifest)
+        for manifest in trace_resp.get("artifacts", [])
+    }
+
+    # 5. Run a research adapter
+    result = TokenBaselineAdapter().run(trace)
+    print(f"[{i}] {prompt[:40]}... → {result.values}")
+```
+
+All adapters (TokenBaseline, RAUQ, EigenScore, ActMap) consume the generic `TraceEnvelope` and artifact tensors. They do not define server routes or paper-specific request fields.
 
 ## Trace Schema
 
 Trace responses use `wllm.trace.v1` and include:
 
-- `generation`: OpenAI-style generation summary.
+- `generation`: OpenAI-style generation summary with choices and usage.
 - `trace.tokens`: token IDs and decoded tokens when requested.
 - `trace.spans`: prompt and generated token spans over the final token sequence.
-- `trace.logprobs`: per-token selected `token_id`/`token`/`logprob` fields and top-k alternatives for generated tokens, plus prompt-token rows when `include_prompt=true`.
-- `trace.hidden_states` and `trace.attentions`: tensor records when supported by the active runtime.
-- `trace_manifest`: persisted JSON trace-bundle manifest for `/v1/traces`.
-- `artifacts`: artifact manifests with byte size, SHA-256, tensor names, shapes, capture dtypes, storage dtypes, and trace ID.
-- `metadata`: sampling, resolved selectors, capabilities, and timing fields.
-
-When model topology is available from vLLM, layer and head selectors are validated against it before extraction proceeds. Trace metadata records resolved selectors for tensor requests, including normalized layer indexes, token positions, and pooling metadata.
+- `trace.logprobs`: per-token selected `token_id`/`token`/`logprob` fields and top-k alternatives.
+- `trace.hidden_states`: tensor records when supported by the active runtime.
+- `trace_manifest`: persisted JSON trace-bundle manifest (for `/v1/traces`).
+- `artifacts`: artifact manifests with byte size, SHA-256, tensor names, shapes, dtypes.
+- `metadata`: sampling params, resolved selectors, capabilities, and timing.
 
 ## Selectors
 
-Layer selectors support integers, integer lists, negative indexes, `all`, `middle`, and `middle_third`.
+Layer selectors: integers, integer lists, negative indexes, `all`, `middle`, `middle_third`.
 
-Position selectors support integers, integer lists, negative indexes, `prompt`, `generated`, `last`, and `last_generated` over the final token sequence after chat-template rendering.
+Position selectors: integers, integer lists, negative indexes, `prompt`, `generated`, `last`, `last_generated`.
 
-Attention key positions additionally support `previous_token`, which maps each valid query position `q` to key `q - 1`.
+Attention key positions: `previous_token` maps query position `q` to key `q-1`.
 
-Hidden-state pooling metadata supports `null`, `mean`, `max`, and `last`.
-
-In the current vLLM runtime, hidden-state tensor values are captured from selected transformer-block modules on an isolated pooling runner. This is post-generation hidden-state replay over the exact prompt token IDs plus generated token IDs reported by vLLM, not online capture from the original autoregressive generation forwards. This path is opt-in per extraction request, guarded by a per-runner lock, and currently limited to `tensor_parallel_size=1`. For validated vLLM 0.10.2, the isolated pooling runner is initialized with eager execution and in-process V1 engine mode so scoped module hooks observe real forward outputs; the normal generation runner keeps its standard vLLM execution path.
+Hidden-state pooling: `null` (per-position), `mean`, `max`, `last`.
 
 ## Resource Limits
 
-Defaults are conservative:
+Server-side defaults (configurable at startup):
 
-- `max_top_k`: 50
-- `max_selected_layers`: 8
-- `max_selected_heads`: 32
-- `max_selected_positions`: 256
-- `max_inline_tensor_bytes`: 1 MB
-- `max_total_captured_tensor_bytes`: 64 MB
-- `max_artifact_bytes`: 256 MB
-- `large_extraction_enabled`: false
+| Limit | Default |
+|-------|---------|
+| `max_top_k` | 50 |
+| `max_selected_layers` | 8 |
+| `max_selected_heads` | 32 |
+| `max_selected_positions` | 256 |
+| `max_inline_tensor_bytes` | 1 MB |
+| `max_total_captured_tensor_bytes` | 64 MB |
+| `max_artifact_bytes` | 256 MB |
+| `large_extraction_enabled` | false |
 
-Requests above configured limits return `413` with an OpenAI-style error envelope.
+Requests exceeding limits return HTTP 413 with an OpenAI-style error envelope.
 
-Inline token-id and logprob numeric payloads are checked against `max_inline_tensor_bytes`. Reduce `max_tokens` or `extract.logprobs.top_k` when inline extraction exceeds this limit.
+## Capability Matrix
 
-Large tensor requests require three things: an artifact request that includes the tensor family, `extract.artifacts.allow_large=true`, and server-side `large_extraction_enabled=true`. Full hidden-state or attention dumps are rejected unless they are artifact-backed and pass the hard byte limits. Hidden-state capture is also checked against `max_total_captured_tensor_bytes` before the pooling runner starts, using the raw captured shape `requested_layers * total_tokens * hidden_size * dtype_bytes`, because the runtime captures the full completed token sequence before applying requested position selectors. The default server configuration keeps large extraction disabled.
+Tested on RTX 5090 (24 GB), vLLM 0.10.2, PyTorch 2.8.0+cu128, max_model_len=1024.
 
-Logprob artifacts require `extract.logprobs`; artifact inclusion alone does not silently request extra vLLM outputs.
+| Capability | Qwen3-0.6B | Llama-3.2-3B | Mistral-7B-Instruct-v0.3 |
+|---|---:|---:|---:|
+| Normal generation | ✅ | ✅ | ✅ |
+| Chat completions | ✅ | ⚠️ base model, no template | ✅ |
+| Text completions | ✅ | ✅ | ✅ |
+| Token ID extraction | ✅ | ✅ | ✅ |
+| Logprob extraction (top-k) | ✅ | ✅ | ✅ |
+| Prompt logprobs | ✅ | ✅ | ✅ |
+| Hidden state replay | ✅ | ✅ | ❌ VRAM |
+| Hidden state online | ✅ | ❌ position mapping | ❌ VRAM |
+| Prewarmed replay | ❌ tokenizer compat | ❌ tokenizer compat | ❌ VRAM |
+| NPZ artifacts | ✅ | ✅ | ✅ (token/logprob only) |
+| PT artifacts | ✅ | ✅ | ✅ (token/logprob only) |
+| Artifact round-trip | ✅ | ✅ | ✅ |
 
-When a captured tensor dtype cannot be represented by the selected storage format, wllm converts explicitly and records both the original capture dtype and the stored dtype. For example, bfloat16 hidden states stored as JSON or NPZ are converted to float32 values with `capture_dtype="torch.bfloat16"` and `storage_dtype="float32"` metadata.
+Legend: ✅ = Working, ❌ = Failing/Unsupported, ⚠️ = Functional with caveat
+
+**Architecture-specific notes:**
+
+- **Llama-3.2-3B** is a base model with no `chat_template` in its tokenizer config. Chat completions fail with `ValueError`. Use `/v1/completions` with raw prompts instead.
+- **Mistral-7B** (~14.5 GB weights) cannot fit a second model instance for replay hidden-state extraction on a 24 GB GPU. Online capture would require fixing the VRAM constraint first. Token/logprob extraction works normally.
+- **Prewarmed replay** fails on all architectures due to a `transformers` 5.12.1 compatibility issue with vLLM 0.10.2 (missing `all_special_tokens_extended` attribute). Single-request replay extraction is unaffected; only repeated prewarmed calls trigger this path. See Known Limitations.
+
+## Tested Model Architectures
+
+| Model | Family | Parameters | Weight Size | HF Architecture |
+|-------|--------|-----------|-------------|-----------------|
+| Qwen3-0.6B | Qwen | 0.6B | ~1.1 GB | Qwen3ForCausalLM |
+| Llama-3.2-3B | Llama | 3B | ~6.0 GB | LlamaForCausalLM |
+| Mistral-7B-Instruct-v0.3 | Mistral | 7B | ~14.5 GB | MistralForCausalLM |
+
+All three use Flash Attention backend on the V1 engine.
+
+Additional models available locally but not yet integration-tested: Qwen3-4B, Qwen3-8B, Llama-3.1-8B.
+
+## Performance Summary
+
+Benchmarked on Qwen3-0.6B, RTX 5090 (24 GB), vLLM 0.10.2, max_model_len=1024, gpu_memory_utilization=0.35, batch size 1, 163 prompt + 32 generated tokens, warm runs (excluding first warmup and vLLM init).
+
+| Mode | Median wall (ms) | vs raw vLLM |
+|------|:---:|:---:|
+| Raw vLLM generate | 90.9 | 1.00× |
+| wllm completion (trace-free) | 90.0 | 0.99× |
+| wllm extract tokens | 90.3 | 0.99× |
+| wllm extract logprobs (top_k=5) | 102.3 | 1.13× |
+| wllm trace + NPZ artifact | 103.8 | 1.14× |
+| wllm hidden inline (1 layer, 1 pos) | 101.8 | 1.12× |
+| wllm hidden NPZ (middle third) | 132.2 | 1.45× |
+| wllm hidden NPZ uncompressed | 128.3 | 1.41× |
+| wllm hidden PT | 128.2 | 1.41× |
+
+Key takeaways:
+- **Normal generation is near cost-free**: wllm trace-free completions run at 0.99× raw vLLM speed.
+- **Token/logprob extraction is cheap**: adds ~12 ms (1.13×) for top_k=5 logprobs over 32 generated tokens. Postprocessing is ~1 ms.
+- **Hidden-state replay is the main cost**: adds ~37-42 ms (1.41-1.45×) for middle-third layers due to the second vLLM encode pass on an isolated pooling runner.
+- **Artifact format matters**: uncompressed NPZ serialization (~0.5 ms) is ~8× faster than compressed NPZ (~3.9 ms) but produces ~2× larger files. PT is comparably fast (~0.6 ms).
+- **Online hidden states** avoid the second pass but require eager in-process generation, which changes the generation performance profile and produces numerically different activations.
+
+Full benchmark data and methodology in `reports/wllm_vllm_stress_report.md` and `reports/wllm_online_vs_replay_report.md`.
+
+## Private vLLM API Dependencies
+
+wllm depends on several private (non-public) vLLM 0.10.2 APIs for hidden-state extraction. These are centralized in `src/runtime/vllm_compat.py` with version guards, expected shapes, and failure modes documented inline. The catalog includes:
+
+| Private API | Used for |
+|---|---|
+| `LLM.apply_model(func)` | Installing scoped hooks on model workers |
+| `LLM.encode(...)` | Replay hidden-state capture via pooling runner |
+| `LLM.supported_tasks` | Runtime capability detection |
+| Model executor internals | Hook installation and tensor capture |
+| Pooling runner initialization | Isolated runner for replay extraction |
+| Eager/in-process engine mode | Online hidden-state capture |
+
+Each access point is version-guarded to vLLM 0.10.2. If the underlying private API changes in a future vLLM version, wllm raises a structured `UnsupportedExtractionError` (HTTP 501) rather than crashing with an opaque traceback. The full catalog with observed shapes and failure behavior is in the `vllm_compat.py` module docstring.
+
+**Note for upgraders**: do not upgrade vLLM beyond 0.10.2 without auditing `vllm_compat.py`. The runtime will reject mismatched vLLM versions at import time with HTTP 503.
+
+## Known Limitations
+
+### Current limitations (0.1.0)
+
+1. **No streaming.** `stream=true` is rejected on all endpoints. This is a design choice for the initial release; the response schema and error handling are simpler without streaming.
+2. **Single GPU only.** `tensor_parallel_size=1` is required for hidden-state extraction. Multi-GPU tensor parallelism (sharded activations) is unsupported.
+3. **Hidden states require ≤0.5 GPU memory.** The replay runner needs a second vLLM instance, consuming roughly double the model weights in VRAM. On a 24 GB GPU, this limits hidden-state replay to models under ~6B parameters.
+4. **Online hidden states not numerically equivalent to replay.** Benchmarked relative L2 error up to 1.26 against replay-mode activations. These are different capture paths with different position semantics.
+5. **`transformers` 5.12.1 compatibility.** The `all_special_tokens_extended` attribute removed in newer `transformers` causes errors when initializing the prewarmed pooling runner. Single-request hidden-state extraction is unaffected. Workaround: pin `transformers` to a vLLM 0.10.2-compatible version, or avoid `--prewarm-hidden-states`.
+6. **Llama online hidden-state position mapping.** Online capture on Llama-3.2-3B fails because the captured tensor's sequence dimension does not cover the requested prompt positions. Replay capture works correctly for Llama.
+7. **No attention weight extraction.** Fused attention backends (Flash Attention) do not expose weight matrices through the public vLLM path.
+8. **No raw logits or exact entropy.** vLLM's public generation output exposes normalized logprobs, not the complete distribution.
+9. **Limited vLLM option surface.** Many `vllm serve` options (quantization, LoRA, speculative decoding, multimodal, tool calling, structured outputs, etc.) are unsupported and rejected.
+10. **Synchronous artifact writes.** `/v1/traces` writes JSON bundles and NPZ/PT artifacts synchronously on the request path. For large artifacts, this adds measurable latency.
+11. **No authentication beyond static API key.** `--api-key` provides a single static bearer token. There is no OAuth, JWT, or multi-user access control.
+
+### Not yet tested
+
+- Models larger than 7B parameters.
+- Batched requests (n > 1), which are explicitly rejected before extraction machinery is allocated.
+- Non-Flash Attention backends.
+- Windows or macOS platforms (developed and tested on Linux only).
+
+## Compatibility with `vllm serve`
+
+wllm is a drop-in replacement for **common** non-streaming vLLM OpenAI serving workflows, not a complete reimplementation. Supported options: `--host`, `--port`, `--dtype`, `--tensor-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`, `--tokenizer`, `--served-model-name`, `--api-key`, `--seed`, `--trust-remote-code`, `--local-files-only`, `--prewarm-hidden-states`, `--enable-online-hidden-states`.
+
+Unsupported vLLM options (rejected with a clear error): `--quantization`, `--kv-cache-dtype`, `--device`, `--load-format`, `--pipeline-parallel-size`, `--speculative-model`, `--lora-modules`, `--chat-template`, `--enable-reasoning`, `--swap-space`, `--max-num-seqs`, `--max-num-batched-tokens`, `--download-dir`, `--enforce-eager`, `--disable-log-requests`, and many others. The full list is in the CLI help and in `tests/unit/test_cli_and_layout.py`.
+
+## Error Envelope
+
+All errors use an OpenAI-compatible envelope:
+
+```json
+{
+  "error": {
+    "message": "Human-readable description.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "schema_validation_failed",
+    "details": {}
+  }
+}
+```
+
+Error types: `authentication_error` (401), `invalid_request_error` (422), `resource_limit_exceeded` (413), `unsupported_extraction` (501), `internal_server_error` (500), `runtime_unavailable` (503).
+
+## Research Adapters
+
+Research adapters consume generic trace objects. A `/v1/traces` response includes a `trace_manifest` that can be loaded:
+
+```python
+from artifacts import load_artifact
+from research.token_baselines import TokenBaselineAdapter
+from tracing.serialization import load_trace_bundle
+
+trace = load_trace_bundle("./wllm-artifacts", trace_response["trace_manifest"])
+result = TokenBaselineAdapter().run(trace)
+```
+
+Custom adapters depend on `TraceEnvelope` and artifact manifests, not server routes or paper-specific fields:
+
+```python
+from research.base import ResearchResult
+from schemas.traces import TraceEnvelope
+
+
+class GeneratedTokenCount:
+    name = "generated_token_count"
+
+    def run(self, trace: TraceEnvelope, **options: object) -> ResearchResult:
+        start, end = trace.trace.spans["generated"]
+        return ResearchResult(
+            name=self.name,
+            status="ok",
+            values={"count": end - start},
+        )
+```
+
+RAUQ, EigenScore, ActMap, and TokenBaseline adapters are under `src/research/`. All currently return `status="unsupported"` except TokenBaseline, which demonstrates the adapter protocol. Research adapters are never imported during normal serving; this isolation is verified by unit tests.
+
+## Tests
+
+**353 unit tests** (no GPU/vLLM required):
+
+```bash
+pytest tests/unit -q
+```
+
+**4 integration tests** (GPU + vLLM + local model required):
+
+```bash
+WLLM_TEST_MODEL=/path/to/local/model pytest tests/integration -m integration -v
+```
+
+The integration suite covers token/logprob extraction, replay hidden-state, online hidden-state, and repeated long-prompt hidden-state smoke tests. Reference configuration: vLLM 0.10.2, PyTorch 2.8.0+cu128, Qwen3-0.6B, `WLLM_TEST_MAX_MODEL_LEN=1024`, `WLLM_TEST_GPU_MEMORY_UTILIZATION=0.35`.
+
+Multi-architecture validation results (Qwen3-0.6B, Llama-3.2-3B, Mistral-7B-Instruct-v0.3) are in `reports/wllm_multi_architecture_validation_report.md`. Benchmark results are in `reports/wllm_vllm_stress_report.md` and related report files.
 
 ## Capability Errors
 
-Unsupported extraction returns:
+The runtime never returns placeholder tensors or synthetic internals. Unsupported capabilities return HTTP 501 with an OpenAI-style error:
 
 ```json
 {
@@ -235,64 +565,9 @@ Unsupported extraction returns:
 }
 ```
 
-The runtime never returns placeholder tensors or synthetic internals.
-
-If the active vLLM `SamplingParams` does not expose `logprobs` or `prompt_logprobs`, extraction requests for those outputs return `unsupported_extraction` with `token_logprobs_unavailable` or `prompt_logprobs_unavailable`. Ordinary OpenAI sampling fields that the active vLLM version does not support remain `422` validation errors.
-
-If the model does not support vLLM's pooling runner, or if tensor parallelism is enabled, hidden-state requests return `unsupported_extraction` with `hidden_states_unavailable` and capability details explaining the unavailable condition.
-
-## vLLM Compatibility Notes
-
-The standard generation path uses vLLM `LLM.generate` and `SamplingParams`. Hidden-state extraction uses isolated compatibility code in `runtime/vllm_compat.py`: vLLM `LLM.encode`, the pooling model conversion path, and scoped `apply_model`/model-executor access for temporary hooks. This private surface is version-guarded to vLLM 0.10.2 and tested with vLLM 0.10.2 in the reference integration environment.
-
-## Research Adapters
-
-Research adapters consume generic trace objects. A `/v1/traces` response includes a `trace_manifest` that can be loaded from the configured artifact directory:
-
-```python
-from artifacts import load_artifact
-from research.token_baselines import TokenBaselineAdapter
-from tracing.serialization import load_trace_bundle
-
-trace = load_trace_bundle("./wllm-artifacts", trace_response["trace_manifest"])
-result = TokenBaselineAdapter().run(trace)
-tensors = [load_artifact("./wllm-artifacts", manifest) for manifest in trace.artifacts]
-```
-
-Custom adapters should depend on `TraceEnvelope`, artifact manifests, and tensor files rather than server routes or paper-specific request fields:
-
-```python
-from research.base import ResearchResult
-from schemas.traces import TraceEnvelope
-
-
-class GeneratedTokenCount:
-    name = "generated_token_count"
-
-    def run(self, trace: TraceEnvelope, **options: object) -> ResearchResult:
-        del options
-        start, end = trace.trace.spans["generated"]
-        return ResearchResult(
-            name=self.name,
-            status="ok",
-            values={"count": end - start},
-        )
-```
-
-RAUQ, EigenScore, probes, and ActMap belong under `src/research/` and must consume trace tensors or artifacts. They do not define public request fields or server routes.
-
-## Tests
-
-Unit tests do not require vLLM, a GPU, or model downloads:
-
-```bash
-pytest tests/unit -q
-```
-
-Integration tests are gated:
-
-```bash
-WLLM_TEST_MODEL=/path/to/local/model pytest -m integration
-```
-
-The integration suite is skipped unless vLLM is installed and `WLLM_TEST_MODEL` points to a local model. It includes a token/logprob smoke test and a hidden-state smoke test using a selected middle layer. The validated reference run used vLLM 0.10.2, PyTorch 2.8 CUDA wheels, Qwen/Qwen3-0.6B from a local Hugging Face cache, `WLLM_TEST_MAX_MODEL_LEN=1024`, and `WLLM_TEST_GPU_MEMORY_UTILIZATION=0.35`. Use a reference model whose vLLM configuration supports the `pooling` runner and `tensor_parallel_size=1` for the hidden-state test. Attention coverage remains capability-gated until the active backend exposes weights.
+Error codes for common unsupported requests:
+- `attention_weights_unavailable` — fused attention backends don't expose weights.
+- `hidden_states_unavailable` — replay requirements not met (TP>1, GPU mem>0.5, no pooling runner).
+- `online_hidden_states_disabled` — online capture requested without `--enable-online-hidden-states`.
+- `exact_entropy_unavailable` — complete distribution not exposed by vLLM.
+- `raw_logits_unavailable` — only normalized logprobs are available.
