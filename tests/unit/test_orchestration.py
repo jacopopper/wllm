@@ -1225,3 +1225,41 @@ def test_extraction_with_only_hidden_states_no_tokens(tmp_path) -> None:
     # But hidden states are still present
     assert len(trace.trace.hidden_states) == 1
     assert trace.trace.hidden_states[0].name == "hidden_states_0"
+
+
+# --- Logprob arrays top_k enforcement ---
+
+
+def test_logprob_arrays_respects_top_k_and_none() -> None:
+    """_logprob_arrays with top_k=3 caps output width at 3; top_k=None returns full width."""
+    # Create rows with 5 candidates each (wider than top_k=3)
+    wide_candidates = [
+        LogprobCandidate(token_id=100 + i, logprob=-float(i), token=f"t{i}") for i in range(5)
+    ]
+    inputs = replace(
+        make_inputs(),
+        generated_logprobs=[list(wide_candidates), list(wide_candidates)],
+        generated_token_ids=[200, 201],
+    )
+    orchestrator = ExtractionOrchestrator(default_vllm_capabilities("fake", "fake"))
+
+    # top_k=3: output width must be <= 3
+    token_ids_3, logprobs_3 = orchestrator._logprob_arrays(inputs, top_k=3)
+    assert token_ids_3.shape == (2, 3)
+    assert logprobs_3.shape == (2, 3)
+    assert token_ids_3[0, 0] == 100
+    assert token_ids_3[0, 1] == 101
+    assert token_ids_3[0, 2] == 102
+    assert logprobs_3[0, 0] == 0.0
+    assert logprobs_3[0, 1] == -1.0
+    assert logprobs_3[0, 2] == -2.0
+
+    # top_k=None: output width is the full row width (5 candidates)
+    token_ids_full, logprobs_full = orchestrator._logprob_arrays(inputs, top_k=None)
+    assert token_ids_full.shape == (2, 5)
+    assert logprobs_full.shape == (2, 5)
+    assert token_ids_full[0, 4] == 104
+    assert logprobs_full[0, 4] == -4.0
+    # Row 1 should have the same values (both rows use identical candidates)
+    assert token_ids_full[1, 4] == 104
+    assert logprobs_full[1, 4] == -4.0
