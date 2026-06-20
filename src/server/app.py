@@ -55,6 +55,7 @@ async def _api_key_middleware(request: Request, call_next):
                     "type": "authentication_error",
                     "param": None,
                     "code": "invalid_api_key",
+                    "details": {},
                 }
             },
         )
