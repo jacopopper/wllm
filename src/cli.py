@@ -5,6 +5,19 @@ import logging
 from pathlib import Path
 
 
+def _nonempty_model(value: str) -> str:
+    """argparse type-check rejecting empty model identifiers.
+
+    Accepts HuggingFace IDs (``org/name``), absolute filesystem paths, and
+    relative filesystem paths. An empty string is rejected so that
+    ``wllm serve ""`` fails with a clear argparse error rather than silently
+    proceeding to vLLM initialization.
+    """
+    if not value:
+        raise argparse.ArgumentTypeError("model must be a non-empty HuggingFace ID or path")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wllm",
@@ -13,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     serve = subparsers.add_parser("serve", help="Start the OpenAI-compatible server.")
-    serve.add_argument("model", help="Model name or local model path to load with vLLM.")
+    serve.add_argument("model", type=_nonempty_model, help="Model name or local model path to load with vLLM.")
     serve.add_argument("--host", default="127.0.0.1", help="Bind host.")
     serve.add_argument("--port", type=int, default=8000, help="Bind port.")
     serve.add_argument("--dtype", default="auto", help="vLLM dtype, for example auto, float16, bfloat16.")
@@ -26,6 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--seed", type=int, default=None, help="Default seed for sampling parameters.")
     serve.add_argument("--trust-remote-code", action="store_true")
     serve.add_argument("--local-files-only", action="store_true", help="Prevent network model downloads.")
+    serve.add_argument(
+        "--prewarm-hidden-states",
+        action="store_true",
+        help="Initialize the optional hidden-state extraction runner before accepting requests.",
+    )
+    serve.add_argument(
+        "--enable-online-hidden-states",
+        action="store_true",
+        help="Enable capture_mode=online using an eager in-process vLLM generation runner.",
+    )
     serve.add_argument("--artifact-dir", default="./wllm-artifacts", help="Directory for trace artifacts.")
     serve.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     serve.set_defaults(func=_cmd_serve)
@@ -53,8 +76,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             seed=args.seed,
             trust_remote_code=args.trust_remote_code,
             local_files_only=args.local_files_only,
+            prewarm_hidden_states=args.prewarm_hidden_states,
+            enable_online_hidden_states=args.enable_online_hidden_states,
         )
     )
+    if runtime.config.prewarm_hidden_states:
+        runtime.prewarm_hidden_states()
     app = create_app(
         runtime=runtime,
         artifact_store=ArtifactStore(Path(args.artifact_dir)),
