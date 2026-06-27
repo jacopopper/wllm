@@ -209,7 +209,7 @@ import importlib.metadata
 import inspect
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from packaging.version import Version
@@ -236,6 +236,23 @@ class OnlineHiddenStateCapture:
     capture_phase: str
     metadata: dict[str, Any]
     overhead_ms: float
+    selected_tensors: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OnlineHiddenStateSelection:
+    name: str
+    layers: list[int]
+    positions: list[int]
+    pool: str | None = None
+
+
+@dataclass(frozen=True)
+class TransformersAttentionReplay:
+    model: Any
+    tokenizer: Any | None
+    torch: Any
+    device: str
 
 
 def _apply_transformers_compat() -> None:
@@ -465,6 +482,135 @@ def extract_supported_runner_types(llm: Any) -> list[str] | None:
     return None
 
 
+def load_transformers_attention_replay(
+    *,
+    model: str,
+    tokenizer: str | None,
+    dtype: str,
+    trust_remote_code: bool,
+    local_files_only: bool,
+) -> TransformersAttentionReplay:
+    """Load the separate Transformers model used for replay attention capture."""
+
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM
+    except Exception as exc:
+        raise UnsupportedExtractionError(
+            "Attention replay requires torch and transformers to be installed.",
+            code="attention_weights_unavailable",
+            param="extract.attentions",
+            details={"exception": repr(exc), "requires": ["torch", "transformers"]},
+        ) from exc
+
+    common_kwargs = {
+        "trust_remote_code": trust_remote_code,
+        "local_files_only": local_files_only,
+    }
+    model_kwargs = dict(common_kwargs)
+    torch_dtype = _transformers_torch_dtype(torch, dtype)
+    if torch_dtype is not None:
+        model_kwargs["dtype"] = torch_dtype
+    model_kwargs["attn_implementation"] = "eager"
+    try:
+        model_obj = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
+    except Exception as exc:
+        raise UnsupportedExtractionError(
+            "Could not initialize the Transformers model for attention replay.",
+            code="attention_weights_unavailable",
+            param="extract.attentions",
+            details={
+                "exception": repr(exc),
+                "model": model,
+                "dtype": dtype,
+                "local_files_only": local_files_only,
+            },
+        ) from exc
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        model_obj.to(device)
+    except Exception as exc:
+        raise UnsupportedExtractionError(
+            "Could not move the Transformers attention replay model to the selected device.",
+            code="attention_weights_unavailable",
+            param="extract.attentions",
+            details={"exception": repr(exc), "model": model, "device": str(device)},
+        ) from exc
+    model_obj.eval()
+    return TransformersAttentionReplay(model=model_obj, tokenizer=None, torch=torch, device=str(device))
+
+
+def capture_transformers_replay_attentions(
+    replay: TransformersAttentionReplay,
+    *,
+    token_ids: list[int],
+) -> dict[int, Any]:
+    """Replay a final token sequence through Transformers with output_attentions=True."""
+
+    if not token_ids:
+        raise UnsupportedExtractionError(
+            "Attention extraction requires at least one token in the final sequence.",
+            code="attention_positions_unavailable",
+            param="extract.attentions",
+        )
+    torch = replay.torch
+    device = _model_device(replay.model, torch)
+    try:
+        input_ids = torch.as_tensor([token_ids], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        with torch.inference_mode():
+            outputs = replay.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                use_cache=False,
+                return_dict=True,
+            )
+    except Exception as exc:
+        raise UnsupportedExtractionError(
+            "The Transformers replay model could not produce attention weights for this sequence.",
+            code="attention_weights_unavailable",
+            param="extract.attentions",
+            details={"exception": repr(exc), "token_count": len(token_ids)},
+        ) from exc
+
+    attentions = getattr(outputs, "attentions", None)
+    if attentions is None and isinstance(outputs, dict):
+        attentions = outputs.get("attentions")
+    if not attentions:
+        raise UnsupportedExtractionError(
+            "The Transformers replay model did not return attention tensors.",
+            code="attention_weights_unavailable",
+            param="extract.attentions",
+            details={"token_count": len(token_ids)},
+        )
+
+    captures: dict[int, Any] = {}
+    for layer_index, tensor in enumerate(attentions):
+        if tensor is None:
+            continue
+        shape = [int(dim) for dim in getattr(tensor, "shape", [])]
+        if len(shape) == 4 and shape[0] == 1:
+            tensor = tensor[0]
+            shape = [int(dim) for dim in getattr(tensor, "shape", [])]
+        if len(shape) != 3:
+            raise UnsupportedExtractionError(
+                "The Transformers replay model returned attention tensors with an unsupported shape.",
+                code="attention_weights_unavailable",
+                param="extract.attentions",
+                details={"layer": layer_index, "shape": shape},
+            )
+        captures[layer_index] = tensor.detach()
+    if not captures:
+        raise UnsupportedExtractionError(
+            "The Transformers replay model returned no usable attention tensors.",
+            code="attention_weights_unavailable",
+            param="extract.attentions",
+            details={"token_count": len(token_ids)},
+        )
+    return captures
+
+
 def capture_pooling_hidden_states(
     pooling_llm: Any,
     *,
@@ -573,15 +719,22 @@ def capture_online_hidden_states(
     layers: list[int],
     generate: Any,
     capture_max_position: int | None = None,
+    select_hidden_states: Any | None = None,
 ) -> OnlineHiddenStateCapture:
     """Capture transformer block outputs from the active generation LLM.
 
     Hooks are installed immediately before the supplied generation callable and
     removed in a finally path. The returned metadata is best-effort because vLLM
     does not expose stable public prefill/decode hook boundaries here.
+
+    When ``select_hidden_states`` is supplied, it is called with the generation
+    output after generation completes and must return
+    ``OnlineHiddenStateSelection`` objects. Selection and pooling then happen on
+    the model worker before tensors are copied back to the request process.
     """
 
     unique_layers = _dedupe_ints(layers)
+    copy_to_cpu = select_hidden_states is None
     install_started = time.perf_counter()
     try:
         install_results = _apply_model_to_workers(
@@ -590,6 +743,7 @@ def capture_online_hidden_states(
                 model,
                 unique_layers,
                 capture_max_position=capture_max_position,
+                copy_to_cpu=copy_to_cpu,
             ),
         )
     except Exception as exc:
@@ -625,17 +779,32 @@ def capture_online_hidden_states(
     except Exception as exc:
         generate_error = exc
 
+    selections: list[OnlineHiddenStateSelection] = []
+    selection_error: Exception | None = None
+    if generate_error is None and select_hidden_states is not None:
+        try:
+            selections = list(select_hidden_states(output))
+        except Exception as exc:
+            selection_error = exc
+
     cleanup_started = time.perf_counter()
     try:
-        capture_results = _apply_model_to_workers(llm, _pop_hidden_state_hooks)
+        if selection_error is None and select_hidden_states is not None:
+            capture_results = _apply_model_to_workers(
+                llm,
+                lambda model: _pop_selected_hidden_state_hooks(model, selections),
+            )
+        else:
+            capture_results = _apply_model_to_workers(llm, _pop_hidden_state_hooks)
     except Exception as exc:
-        if generate_error is not None:
+        if generate_error is not None or selection_error is not None:
+            primary_error = generate_error or selection_error
             raise UnsupportedExtractionError(
-                "Online hidden-state capture cleanup failed after generation failed.",
+                "Online hidden-state capture cleanup failed after generation or selector planning failed.",
                 code="online_hidden_states_unavailable",
                 param="extract.hidden_states",
-                details={"exception": repr(generate_error), "cleanup_exception": repr(exc)},
-            ) from generate_error
+                details={"exception": repr(primary_error), "cleanup_exception": repr(exc)},
+            ) from primary_error
         raise UnsupportedExtractionError(
             "Could not remove scoped online hidden-state capture hooks from the active vLLM generation runner.",
             code="online_hidden_states_unavailable",
@@ -646,16 +815,41 @@ def capture_online_hidden_states(
 
     if generate_error is not None:
         raise generate_error
+    if selection_error is not None:
+        raise selection_error
 
-    captures = _combine_capture_results(capture_results)
-    missing = set(unique_layers) - set(captures)
-    if missing:
-        raise UnsupportedExtractionError(
-            "The active vLLM generation runner did not capture every requested hidden-state layer.",
-            code="online_hidden_state_layer_unavailable",
-            param="extract.hidden_states",
-            details={"missing_layers": sorted(missing), "captured_layers": sorted(captures)},
-        )
+    selected_tensors: dict[str, Any] = {}
+    if select_hidden_states is None:
+        captures = _combine_capture_results(capture_results)
+        layer_chunk_shapes = _layer_chunk_shapes(capture_results)
+        missing = set(unique_layers) - set(captures)
+        if missing:
+            raise UnsupportedExtractionError(
+                "The active vLLM generation runner did not capture every requested hidden-state layer.",
+                code="online_hidden_state_layer_unavailable",
+                param="extract.hidden_states",
+                details={"missing_layers": sorted(missing), "captured_layers": sorted(captures)},
+            )
+    else:
+        captures = {}
+        layer_chunk_shapes = _selected_capture_layer_chunk_shapes(capture_results)
+        selected_errors = [result for result in capture_results if isinstance(result, dict) and result.get("error")]
+        if selected_errors:
+            raise UnsupportedExtractionError(
+                "The active vLLM generation runner could not select requested hidden-state tensors.",
+                code="online_hidden_states_unavailable",
+                param="extract.hidden_states",
+                details={"errors": selected_errors},
+            )
+        selected_tensors = _combine_selected_capture_results(capture_results)
+        missing = {selection.name for selection in selections} - set(selected_tensors)
+        if missing:
+            raise UnsupportedExtractionError(
+                "The active vLLM generation runner did not return every selected hidden-state tensor.",
+                code="online_hidden_state_selection_unavailable",
+                param="extract.hidden_states",
+                details={"missing_tensors": sorted(missing), "captured_tensors": sorted(selected_tensors)},
+            )
 
     return OnlineHiddenStateCapture(
         output=output,
@@ -667,10 +861,13 @@ def capture_online_hidden_states(
             "boundary_source": "forward_hook_chunk_shapes",
             "install_ms": install_ms,
             "cleanup_ms": cleanup_ms,
-            "layer_chunk_shapes": _layer_chunk_shapes(capture_results),
+            "layer_chunk_shapes": layer_chunk_shapes,
+            "selected_tensor_shapes": _selected_tensor_shapes(selected_tensors),
+            "selection_mode": "worker_selected" if select_hidden_states is not None else "raw_capture",
             "capture_filter": _capture_filter_metadata(capture_max_position),
         },
         overhead_ms=install_ms + cleanup_ms,
+        selected_tensors=selected_tensors,
     )
 
 
@@ -807,6 +1004,7 @@ def _install_hidden_state_hooks(
     layers: list[int],
     *,
     capture_max_position: int | None = None,
+    copy_to_cpu: bool = True,
 ) -> dict[str, Any]:
     """Install forward hooks on selected transformer-block layers.
 
@@ -817,8 +1015,11 @@ def _install_hidden_state_hooks(
 
     **Expected shape:**
     Each hook intercepts the forward pass output, extracts the first
-    tensor, detaches and CPU-clones it, and appends it to a per-layer
+    tensor, detaches it, and appends it to a per-layer
     capture list stored on ``model._wllm_hidden_state_capture``.
+    ``copy_to_cpu=True`` preserves the legacy raw-capture behavior.
+    ``copy_to_cpu=False`` keeps tensors on the worker until selector
+    compaction runs in ``_pop_selected_hidden_state_hooks``.
 
     Returns a dict with ``installed_layers``, ``num_layers``, and
     optional ``capture_filter`` metadata.
@@ -841,7 +1042,9 @@ def _install_hidden_state_hooks(
         "captures": {},
         "handles": [],
         "offsets": {},
+        "chunk_shapes": {},
         "capture_max_position": capture_max_position,
+        "copy_to_cpu": copy_to_cpu,
     }
     setattr(model, "_wllm_hidden_state_capture", state)
     for layer in layers:
@@ -854,7 +1057,9 @@ def _install_hidden_state_hooks(
                 state["offsets"][layer_index] = offset + _tensor_row_count(tensor)
                 tensor = _slice_capture_prefix(tensor, offset, state["capture_max_position"])
                 if tensor is not None:
-                    state["captures"].setdefault(layer_index, []).append(_to_cpu_tensor(tensor))
+                    state["chunk_shapes"].setdefault(layer_index, []).append(_shape_of_tensor(tensor))
+                    captured = _to_cpu_tensor(tensor) if state["copy_to_cpu"] else _detach_tensor(tensor)
+                    state["captures"].setdefault(layer_index, []).append(captured)
 
         state["handles"].append(module.register_forward_hook(hook))
     return {
@@ -871,6 +1076,41 @@ def _pop_hidden_state_hooks(model: Any) -> dict[int, Any]:
     captures = dict(state.get("captures", {}))
     _remove_existing_hidden_state_hooks(model)
     return captures
+
+
+def _pop_selected_hidden_state_hooks(
+    model: Any,
+    selections: list[OnlineHiddenStateSelection],
+) -> dict[str, Any]:
+    state = getattr(model, "_wllm_hidden_state_capture", None)
+    if not isinstance(state, dict):
+        return {
+            "error": "hidden_state_capture_state_unavailable",
+            "requested_tensors": [selection.name for selection in selections],
+        }
+    captures = dict(state.get("captures", {}))
+    chunk_shapes = {
+        str(int(layer)): [list(shape) for shape in shapes]
+        for layer, shapes in dict(state.get("chunk_shapes", {})).items()
+    }
+    try:
+        selected = {
+            selection.name: _select_hidden_state_capture(captures, selection)
+            for selection in selections
+        }
+        return {
+            "__selected_tensors__": selected,
+            "__layer_chunk_shapes__": chunk_shapes,
+        }
+    except Exception as exc:
+        return {
+            "error": "hidden_state_selection_failed",
+            "exception": repr(exc),
+            "requested_tensors": [selection.name for selection in selections],
+            "layer_chunk_shapes": chunk_shapes,
+        }
+    finally:
+        _remove_existing_hidden_state_hooks(model)
 
 
 def _remove_existing_hidden_state_hooks(model: Any) -> None:
@@ -961,6 +1201,13 @@ def _to_cpu_tensor(tensor: Any) -> Any:
     return tensor
 
 
+def _detach_tensor(tensor: Any) -> Any:
+    detach = getattr(tensor, "detach", None)
+    if callable(detach):
+        tensor = detach()
+    return tensor
+
+
 def _tensor_row_count(tensor: Any) -> int:
     shape = getattr(tensor, "shape", None)
     if shape is not None and len(shape) > 0:
@@ -1012,6 +1259,99 @@ def _combine_capture_results(capture_results: list[Any]) -> dict[int, Any]:
     return {layer: _combine_layer_captures(captures) for layer, captures in per_layer.items()}
 
 
+def _select_hidden_state_capture(
+    captures: dict[int, Any],
+    selection: OnlineHiddenStateSelection,
+) -> Any:
+    selected_layers = []
+    for layer in selection.layers:
+        layer_captures = captures.get(layer)
+        if layer_captures is None:
+            raise ValueError(f"missing captured hidden states for layer {layer}")
+        layer_tensor = _combine_layer_captures(layer_captures)
+        selected_layers.append(
+            _select_positions_from_tensor(
+                layer_tensor,
+                positions=selection.positions,
+                pool=selection.pool,
+            )
+        )
+    return _to_cpu_tensor(_stack_tensors(selected_layers))
+
+
+def _select_positions_from_tensor(tensor: Any, *, positions: list[int], pool: str | None) -> Any:
+    if not positions:
+        raise ValueError("hidden-state position selector resolved to no positions")
+    if min(positions) < 0:
+        raise ValueError(f"hidden-state source positions cannot be negative: {positions!r}")
+    shape = _shape_of_tensor(tensor)
+    if not shape or shape[0] <= max(positions):
+        raise ValueError(
+            "captured hidden states do not cover requested source positions: "
+            f"shape={shape!r} positions={positions!r}"
+        )
+    if _is_torch_tensor(tensor):
+        import torch
+
+        index = torch.as_tensor(positions, dtype=torch.long, device=tensor.device)
+        selected = tensor.index_select(0, index)
+        if pool == "mean":
+            return selected.mean(dim=0)
+        if pool == "max":
+            return selected.max(dim=0).values
+        if pool == "last":
+            return selected[-1]
+        return selected
+
+    import numpy as np
+
+    array = np.asarray(tensor)
+    selected = np.take(array, np.asarray(positions, dtype=np.int64), axis=0)
+    if pool == "mean":
+        return selected.mean(axis=0)
+    if pool == "max":
+        return selected.max(axis=0)
+    if pool == "last":
+        return selected[-1]
+    return selected
+
+
+def _stack_tensors(tensors: list[Any]) -> Any:
+    if not tensors:
+        raise ValueError("hidden-state layer selector resolved to no layers")
+    if all(_is_torch_tensor(tensor) for tensor in tensors):
+        import torch
+
+        return torch.stack(tensors, dim=0)
+    import numpy as np
+
+    return np.stack([np.asarray(tensor) for tensor in tensors], axis=0)
+
+
+def _combine_selected_capture_results(capture_results: list[Any]) -> dict[str, Any]:
+    selected: dict[str, Any] = {}
+    for result in capture_results:
+        if not isinstance(result, dict):
+            continue
+        tensors = result.get("__selected_tensors__")
+        if isinstance(tensors, dict):
+            selected.update(tensors)
+    return selected
+
+
+def _selected_capture_layer_chunk_shapes(capture_results: list[Any]) -> dict[str, list[list[int]]]:
+    shapes: dict[str, list[list[int]]] = {}
+    for result in capture_results:
+        if not isinstance(result, dict):
+            continue
+        worker_shapes = result.get("__layer_chunk_shapes__")
+        if not isinstance(worker_shapes, dict):
+            continue
+        for layer, chunks in worker_shapes.items():
+            shapes.setdefault(str(layer), []).extend([list(chunk) for chunk in chunks])
+    return shapes
+
+
 def _layer_chunk_shapes(capture_results: list[Any]) -> dict[str, list[list[int]]]:
     shapes: dict[str, list[list[int]]] = {}
     for result in capture_results:
@@ -1021,6 +1361,10 @@ def _layer_chunk_shapes(capture_results: list[Any]) -> dict[str, list[list[int]]
             chunks = captures if isinstance(captures, list) else [captures]
             shapes.setdefault(str(int(layer)), []).extend(_shape_of_tensor(chunk) for chunk in chunks)
     return shapes
+
+
+def _selected_tensor_shapes(selected_tensors: dict[str, Any]) -> dict[str, list[int]]:
+    return {name: _shape_of_tensor(tensor) for name, tensor in selected_tensors.items()}
 
 
 def _capture_filter_metadata(capture_max_position: int | None) -> dict[str, Any] | None:
@@ -1055,6 +1399,24 @@ def _dedupe_ints(values: list[int]) -> list[int]:
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _transformers_torch_dtype(torch: Any, dtype: str) -> Any | None:
+    normalized = dtype.lower()
+    if normalized in {"float16", "half"}:
+        return torch.float16
+    if normalized == "bfloat16":
+        return torch.bfloat16
+    if normalized in {"float32", "float"}:
+        return torch.float32
+    return None
+
+
+def _model_device(model: Any, torch: Any) -> Any:
+    try:
+        return next(model.parameters()).device
+    except Exception:
+        return torch.device("cpu")
 
 
 def _first_str_attr(obj: Any, names: list[str]) -> str | None:

@@ -42,10 +42,16 @@ class GeneratedTraceInputs:
     prompt_logprobs: list[list[LogprobCandidate]] = field(default_factory=list)
     generated_logprobs: list[list[LogprobCandidate]] = field(default_factory=list)
     hidden_states: dict[int, Any] = field(default_factory=dict)
+    preselected_hidden_states: dict[str, Any] = field(default_factory=dict)
     hidden_state_capture_site: str = "transformer_block_output"
     hidden_state_capture_mode: str = "replay"
     hidden_state_capture_phase: str = "replay"
     hidden_state_capture_metadata: dict[str, Any] = field(default_factory=dict)
+    attentions: dict[int, Any] = field(default_factory=dict)
+    attention_capture_site: str = "attention_weights"
+    attention_capture_mode: str = "replay"
+    attention_capture_phase: str = "replay"
+    attention_capture_metadata: dict[str, Any] = field(default_factory=dict)
     generation_ms: float = 0.0
     capture_ms: float = 0.0
     topology: RuntimeTopology | None = None
@@ -57,7 +63,21 @@ class HiddenStateTensor:
     tensor: Any
     layers: list[int]
     positions: list[int]
-    pool: str | None
+    capture_site: str
+    capture_mode: str
+    capture_phase: str
+    position_semantics: dict[str, Any]
+    capture_metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AttentionTensor:
+    name: str
+    tensor: Any
+    layers: list[int]
+    heads: list[int]
+    query_positions: list[int]
+    key_positions: dict[int, list[int]]
     capture_site: str
     capture_mode: str
     capture_phase: str
@@ -115,7 +135,7 @@ class ExtractionOrchestrator:
             hidden_states_unavailable(
                 details={"capability": self.capabilities.hidden_states.model_dump(mode="json")}
             )
-        if spec.attentions:
+        if spec.attentions and self.capabilities.attentions.state == "unsupported":
             attentions_unavailable(
                 details={"capability": self.capabilities.attentions.model_dump(mode="json")}
             )
@@ -126,20 +146,12 @@ class ExtractionOrchestrator:
                 param="extract.artifacts.include",
                 details={"missing": "extract.hidden_states", "artifact": "hidden_states"},
             )
-        if (
-            spec.artifacts
-            and "hidden_states" in spec.artifacts.include
-            and replay_hidden_states
-            and self.capabilities.hidden_states.state == "unsupported"
-        ):
-            hidden_states_unavailable(
-                details={"capability": self.capabilities.hidden_states.model_dump(mode="json")}
-            )
-        if spec.artifacts and "attentions" in spec.artifacts.include:
-            raise UnsupportedExtractionError(
-                "Requested artifact contents require unsupported tensor extraction.",
-                code="artifact_contents_unavailable",
+        if spec.artifacts and "attentions" in spec.artifacts.include and not spec.attentions:
+            raise InvalidRequestError(
+                "Attention artifacts require extract.attentions so the runtime knows what to capture.",
+                code="artifact_dependency_missing",
                 param="extract.artifacts.include",
+                details={"missing": "extract.attentions", "artifact": "attentions"},
             )
 
     def build_trace(
@@ -193,7 +205,8 @@ class ExtractionOrchestrator:
                 limits=limits,
             )
         hidden_tensors = self._hidden_state_tensors(request, inputs, plan)
-        self._check_inline_bytes(request, inputs, token_ids, limits, hidden_tensors)
+        attention_tensors = self._attention_tensors(request, inputs, plan)
+        self._check_inline_bytes(request, inputs, token_ids, limits, hidden_tensors, attention_tensors)
         trace = TraceEnvelope(
             id=trace_id,
             created=int(time.time()),
@@ -234,10 +247,17 @@ class ExtractionOrchestrator:
                 artifact_store,
                 persist,
                 hidden_tensors=hidden_tensors,
+                attention_tensors=attention_tensors,
             )
         )
         hidden_artifact_id = self._artifact_id_for_hidden_states(request, trace.artifacts)
+        attention_artifact_id = self._artifact_id_for_attentions(request, trace.artifacts)
         trace.trace.hidden_states = self._hidden_state_records(request, hidden_tensors, artifact_id=hidden_artifact_id)
+        trace.trace.attentions = self._attention_records(
+            request,
+            attention_tensors,
+            artifact_id=attention_artifact_id,
+        )
         if persist:
             trace.trace_manifest = artifact_store.put_trace_bundle(
                 trace_id=trace.id,
@@ -336,8 +356,10 @@ class ExtractionOrchestrator:
         artifact_store: ArtifactStore,
         persist: bool,
         hidden_tensors: list[HiddenStateTensor] | None = None,
+        attention_tensors: list[AttentionTensor] | None = None,
     ) -> list[Any]:
         hidden_tensors = hidden_tensors or []
+        attention_tensors = attention_tensors or []
         artifact_request = request.extract.artifacts
         if artifact_request is None:
             return []
@@ -360,6 +382,9 @@ class ExtractionOrchestrator:
         if "hidden_states" in include:
             for hidden in hidden_tensors:
                 tensors[hidden.name] = hidden.tensor
+        if "attentions" in include:
+            for attention in attention_tensors:
+                tensors[attention.name] = attention.tensor
         total_bytes = sum(_tensor_artifact_nbytes(tensor, artifact_request.format) for tensor in tensors.values())
         if total_bytes > limits.max_total_captured_tensor_bytes:
             raise ResourceLimitError(
@@ -397,6 +422,7 @@ class ExtractionOrchestrator:
         token_ids: list[int],
         limits: ResourceLimits,
         hidden_tensors: list[HiddenStateTensor] | None = None,
+        attention_tensors: list[AttentionTensor] | None = None,
     ) -> None:
         inline_bytes = 0
         if request.extract.tokens:
@@ -427,6 +453,22 @@ class ExtractionOrchestrator:
                     "Requested hidden-state tensors exceed the total captured tensor byte limit.",
                     param="extract.hidden_states",
                     details={"requested_bytes": inline_hidden_bytes, "limit": limits.max_total_captured_tensor_bytes},
+                )
+        inline_attention_bytes = 0
+        if not self._attentions_artifact_requested(request):
+            inline_attention_bytes = sum(
+                _tensor_storage_nbytes(attention.tensor)
+                for attention in attention_tensors or []
+            )
+            inline_bytes += inline_attention_bytes
+            if inline_attention_bytes > limits.max_total_captured_tensor_bytes:
+                raise ResourceLimitError(
+                    "Requested attention tensors exceed the total captured tensor byte limit.",
+                    param="extract.attentions",
+                    details={
+                        "requested_bytes": inline_attention_bytes,
+                        "limit": limits.max_total_captured_tensor_bytes,
+                    },
                 )
         if inline_bytes > limits.max_inline_tensor_bytes:
             raise ResourceLimitError(
@@ -475,7 +517,7 @@ class ExtractionOrchestrator:
                 code="hidden_state_topology_unavailable",
                 param="extract.hidden_states",
             )
-        if not inputs.hidden_states:
+        if not inputs.hidden_states and not inputs.preselected_hidden_states:
             raise UnsupportedExtractionError(
                 "Hidden-state extraction was requested, but the active vLLM path did not capture hidden-state tensors.",
                 code="hidden_states_unavailable",
@@ -504,28 +546,30 @@ class ExtractionOrchestrator:
                 capture_mode=capture_mode,
                 capture_phase=capture_phase,
             )
-            tensor = self._select_hidden_state_tensor(
-                inputs.hidden_states,
-                layers=selection["layers"],
-                positions=source_positions,
-                pool=selection["pool"],
-                param=f"extract.hidden_states[{index}]",
-                token_context={
-                    "prompt_token_count": len(inputs.prompt_token_ids),
-                    "generated_token_count": len(inputs.generated_token_ids),
-                    "total_token_count": len(inputs.prompt_token_ids) + len(inputs.generated_token_ids),
-                    "requested_positions": selection["positions"],
-                    "source_positions": source_positions,
-                    "capture_mode": capture_mode,
-                },
-            )
+            name = f"hidden_states_{index}"
+            tensor = inputs.preselected_hidden_states.get(name)
+            if tensor is None:
+                tensor = self._select_hidden_state_tensor(
+                    inputs.hidden_states,
+                    layers=selection["layers"],
+                    positions=source_positions,
+                    pool=selection["pool"],
+                    param=f"extract.hidden_states[{index}]",
+                    token_context={
+                        "prompt_token_count": len(inputs.prompt_token_ids),
+                        "generated_token_count": len(inputs.generated_token_ids),
+                        "total_token_count": len(inputs.prompt_token_ids) + len(inputs.generated_token_ids),
+                        "requested_positions": selection["positions"],
+                        "source_positions": source_positions,
+                        "capture_mode": capture_mode,
+                    },
+                )
             hidden_tensors.append(
                 HiddenStateTensor(
-                    name=f"hidden_states_{index}",
+                    name=name,
                     tensor=tensor,
                     layers=selection["layers"],
                     positions=selection["positions"],
-                    pool=selection["pool"],
                     capture_site=inputs.hidden_state_capture_site,
                     capture_mode=capture_mode,
                     capture_phase=capture_phase,
@@ -592,19 +636,158 @@ class ExtractionOrchestrator:
             )
         return records
 
+    def _attention_tensors(
+        self,
+        request: ExtractRequest,
+        inputs: GeneratedTraceInputs,
+        plan: ExtractionPlan | None,
+    ) -> list[AttentionTensor]:
+        if not request.extract.attentions:
+            return []
+        if plan is None:
+            raise UnsupportedExtractionError(
+                "Attention extraction requires runtime topology so selectors can be resolved.",
+                code="attention_topology_unavailable",
+                param="extract.attentions",
+            )
+        if not inputs.attentions:
+            raise UnsupportedExtractionError(
+                "Attention extraction was requested, but the active replay path did not capture attention tensors.",
+                code="attention_weights_unavailable",
+                param="extract.attentions",
+                details={"capability": self.capabilities.attentions.model_dump(mode="json")},
+            )
+        attention_tensors = []
+        for index, selection in enumerate(plan.attentions):
+            tensor, resolved_heads = self._select_attention_tensor(
+                inputs.attentions,
+                layers=selection["layers"],
+                heads=selection["heads"],
+                query_positions=selection["query_positions"],
+                key_positions=selection["key_positions"],
+                param=f"extract.attentions[{index}]",
+                token_context={
+                    "prompt_token_count": len(inputs.prompt_token_ids),
+                    "generated_token_count": len(inputs.generated_token_ids),
+                    "total_token_count": len(inputs.prompt_token_ids) + len(inputs.generated_token_ids),
+                    "requested_query_positions": selection["query_positions"],
+                    "requested_key_positions": selection["key_positions"],
+                },
+            )
+            attention_tensors.append(
+                AttentionTensor(
+                    name=f"attentions_{index}",
+                    tensor=tensor,
+                    layers=selection["layers"],
+                    heads=resolved_heads,
+                    query_positions=selection["query_positions"],
+                    key_positions=selection["key_positions"],
+                    capture_site=inputs.attention_capture_site,
+                    capture_mode=inputs.attention_capture_mode,
+                    capture_phase=inputs.attention_capture_phase,
+                    position_semantics=_attention_position_semantics(
+                        prompt_token_count=len(inputs.prompt_token_ids),
+                        generated_token_count=len(inputs.generated_token_ids),
+                        query_positions=selection["query_positions"],
+                        key_positions=selection["key_positions"],
+                    ),
+                    capture_metadata=inputs.attention_capture_metadata,
+                )
+            )
+        return attention_tensors
+
+    def _select_attention_tensor(
+        self,
+        captured: dict[int, Any],
+        *,
+        layers: list[int],
+        heads: list[int] | str,
+        query_positions: list[int],
+        key_positions: dict[int, list[int]],
+        param: str,
+        token_context: dict[str, Any] | None = None,
+    ) -> tuple[Any, list[int]]:
+        selected = []
+        resolved_heads: list[int] | None = None
+        for layer in layers:
+            source = captured.get(layer)
+            if source is None:
+                raise UnsupportedExtractionError(
+                    f"Attention weights for layer {layer} were not captured by the replay path.",
+                    code="attention_layer_unavailable",
+                    param=param,
+                    details={"layer": layer, "captured_layers": sorted(captured)},
+                )
+            layer_tensor = _normalize_attention_tensor(source, param=param, layer=layer)
+            layer_heads = list(range(_tensor_shape(layer_tensor)[0])) if heads == "all" else list(heads)
+            if resolved_heads is None:
+                resolved_heads = layer_heads
+            elif resolved_heads != layer_heads:
+                raise UnsupportedExtractionError(
+                    "Replay attention layers exposed inconsistent head counts.",
+                    code="attention_head_unavailable",
+                    param=param,
+                    details={"layer": layer, "heads": layer_heads, "expected_heads": resolved_heads},
+                )
+            selected.append(
+                _select_attention_positions(
+                    layer_tensor,
+                    heads=layer_heads,
+                    query_positions=query_positions,
+                    key_positions=key_positions,
+                    param=param,
+                    token_context=token_context,
+                )
+            )
+        return _stack_tensors(selected, param=param, empty_name="Attention layer selector"), resolved_heads or []
+
+    def _attention_records(
+        self,
+        request: ExtractRequest,
+        attention_tensors: list[AttentionTensor],
+        *,
+        artifact_id: str | None,
+    ) -> list[Any]:
+        inline = not self._attentions_artifact_requested(request)
+        records = []
+        for attention in attention_tensors:
+            capture_dtype = _tensor_dtype(attention.tensor)
+            storage_dtype = _tensor_storage_dtype(attention.tensor)
+            records.append(
+                TensorRecord(
+                    name=attention.name,
+                    shape=_tensor_shape(attention.tensor),
+                    dtype=capture_dtype,
+                    capture_dtype=capture_dtype,
+                    storage_dtype=storage_dtype,
+                    device=_tensor_device(attention.tensor),
+                    layers=attention.layers,
+                    heads=attention.heads,
+                    positions=attention.query_positions,
+                    capture_site=attention.capture_site,
+                    capture_mode=attention.capture_mode,  # type: ignore[arg-type]
+                    capture_phase=attention.capture_phase,
+                    position_semantics=attention.position_semantics,
+                    capture_metadata=attention.capture_metadata,
+                    data=_tensor_to_jsonable(attention.tensor) if inline else None,
+                    artifact_id=None if inline else artifact_id,
+                    byte_size=_tensor_storage_nbytes(attention.tensor),
+                )
+            )
+        return records
+
     def _capture_metadata(
         self,
         request: ExtractRequest,
         inputs: GeneratedTraceInputs,
         plan: ExtractionPlan | None,
     ) -> dict[str, Any]:
-        if not request.extract.hidden_states:
-            return {}
-        hidden_selectors = plan.hidden_states if plan is not None else []
-        capture_modes = sorted({str(item.get("capture_mode", inputs.hidden_state_capture_mode))
-                               for item in hidden_selectors})
-        return {
-            "hidden_states": {
+        metadata: dict[str, Any] = {}
+        if request.extract.hidden_states:
+            hidden_selectors = plan.hidden_states if plan is not None else []
+            capture_modes = sorted({str(item.get("capture_mode", inputs.hidden_state_capture_mode))
+                                   for item in hidden_selectors})
+            metadata["hidden_states"] = {
                 "capture_modes": capture_modes or [inputs.hidden_state_capture_mode],
                 "capture_site": inputs.hidden_state_capture_site,
                 "capture_phase": inputs.hidden_state_capture_phase,
@@ -618,17 +801,42 @@ class ExtractionOrchestrator:
                 ),
                 "capture_metadata": inputs.hidden_state_capture_metadata,
             }
-        }
+        if request.extract.attentions:
+            metadata["attentions"] = {
+                "capture_modes": [inputs.attention_capture_mode],
+                "capture_site": inputs.attention_capture_site,
+                "capture_phase": inputs.attention_capture_phase,
+                "position_semantics": _attention_position_semantics(
+                    prompt_token_count=len(inputs.prompt_token_ids),
+                    generated_token_count=len(inputs.generated_token_ids),
+                    query_positions=[],
+                    key_positions={},
+                ),
+                "capture_metadata": inputs.attention_capture_metadata,
+            }
+        return metadata
 
     def _hidden_states_artifact_requested(self, request: ExtractRequest) -> bool:
         artifacts = request.extract.artifacts
         return bool(artifacts and "hidden_states" in artifacts.include)
+
+    def _attentions_artifact_requested(self, request: ExtractRequest) -> bool:
+        artifacts = request.extract.artifacts
+        return bool(artifacts and "attentions" in artifacts.include)
 
     def _artifact_id_for_hidden_states(self, request: ExtractRequest, artifacts: list[Any]) -> str | None:
         if not self._hidden_states_artifact_requested(request):
             return None
         for artifact in artifacts:
             if "hidden_states_0" in artifact.included_tensor_names:
+                return artifact.artifact_id
+        return None
+
+    def _artifact_id_for_attentions(self, request: ExtractRequest, artifacts: list[Any]) -> str | None:
+        if not self._attentions_artifact_requested(request):
+            return None
+        for artifact in artifacts:
+            if "attentions_0" in artifact.included_tensor_names:
                 return artifact.artifact_id
         return None
 
@@ -701,6 +909,140 @@ def _hidden_state_position_semantics(
     }
 
 
+def _attention_position_semantics(
+    *,
+    prompt_token_count: int,
+    generated_token_count: int,
+    query_positions: list[int],
+    key_positions: dict[int, list[int]],
+) -> dict[str, Any]:
+    total_token_count = prompt_token_count + generated_token_count
+    return {
+        "position_index_space": "combined_prompt_then_generated_tokens",
+        "prompt_span": [0, prompt_token_count],
+        "generated_span": [prompt_token_count, total_token_count],
+        "selected_query_positions": query_positions,
+        "selected_key_positions_by_query": [
+            {"query_position": query, "key_positions": key_positions.get(query, [])}
+            for query in query_positions
+        ],
+        "attention_semantics": "Each value is the replay attention weight from a query position to a key position.",
+        "key_axis_padding": (
+            "If key selectors resolve to different counts per query, the key axis is padded with NaN "
+            "after the selected keys for that query."
+        ),
+        "capture_mode": "replay",
+        "capture_phase": "replay",
+    }
+
+
+def _normalize_attention_tensor(tensor: Any, *, param: str, layer: int) -> Any:
+    shape = _tensor_shape(tensor)
+    if len(shape) == 4 and shape[0] == 1:
+        tensor = tensor[0]
+        shape = _tensor_shape(tensor)
+    if len(shape) != 3:
+        raise UnsupportedExtractionError(
+            "Captured attention tensor must have shape [heads, query_positions, key_positions].",
+            code="attention_weights_unavailable",
+            param=param,
+            details={"layer": layer, "shape": shape},
+        )
+    return tensor
+
+
+def _select_attention_positions(
+    tensor: Any,
+    *,
+    heads: list[int],
+    query_positions: list[int],
+    key_positions: dict[int, list[int]],
+    param: str,
+    token_context: dict[str, Any] | None = None,
+) -> Any:
+    if not heads:
+        raise InvalidRequestError("Attention head selector resolved to no heads.", code="invalid_selector", param=param)
+    if not query_positions:
+        raise InvalidRequestError(
+            "Attention query-position selector resolved to no positions.",
+            code="invalid_selector",
+            param=param,
+        )
+    shape = _tensor_shape(tensor)
+    head_count = shape[0]
+    query_count = shape[1]
+    key_count = shape[2]
+    if min(heads) < 0 or max(heads) >= head_count:
+        raise UnsupportedExtractionError(
+            "Captured attention weights do not cover all requested heads.",
+            code="attention_head_unavailable",
+            param=param,
+            details={"shape": shape, "heads": heads, "captured_head_count": head_count},
+        )
+    max_query = max(query_positions)
+    min_query = min(query_positions)
+    if min_query < 0 or max_query >= query_count:
+        details = {
+            "shape": shape,
+            "captured_query_count": query_count,
+            "query_positions": query_positions,
+            "max_requested_query_position": max_query,
+        }
+        if token_context is not None:
+            details.update(token_context)
+        raise UnsupportedExtractionError(
+            "Captured attention weights do not cover all requested query positions.",
+            code="attention_position_unavailable",
+            param=param,
+            details=details,
+        )
+    all_keys = [key for query in query_positions for key in key_positions.get(query, [])]
+    if all_keys and (min(all_keys) < 0 or max(all_keys) >= key_count):
+        details = {
+            "shape": shape,
+            "captured_key_count": key_count,
+            "key_positions": key_positions,
+            "max_requested_key_position": max(all_keys),
+        }
+        if token_context is not None:
+            details.update(token_context)
+        raise UnsupportedExtractionError(
+            "Captured attention weights do not cover all requested key positions.",
+            code="attention_position_unavailable",
+            param=param,
+            details=details,
+        )
+    max_selected_keys = max((len(key_positions.get(query, [])) for query in query_positions), default=0)
+    if _is_torch_tensor(tensor):
+        import torch
+
+        head_index = torch.as_tensor(heads, dtype=torch.long, device=tensor.device)
+        selected_heads = tensor.index_select(0, head_index)
+        result = torch.full(
+            (len(heads), len(query_positions), max_selected_keys),
+            float("nan"),
+            dtype=selected_heads.dtype,
+            device=selected_heads.device,
+        )
+        for query_offset, query in enumerate(query_positions):
+            keys = key_positions.get(query, [])
+            if not keys:
+                continue
+            key_index = torch.as_tensor(keys, dtype=torch.long, device=tensor.device)
+            result[:, query_offset, :len(keys)] = selected_heads[:, query, :].index_select(1, key_index)
+        return result
+
+    array = np.asarray(tensor)
+    selected_heads = np.take(array, np.asarray(heads, dtype=np.int64), axis=0)
+    result = np.full((len(heads), len(query_positions), max_selected_keys), np.nan, dtype=selected_heads.dtype)
+    for query_offset, query in enumerate(query_positions):
+        keys = key_positions.get(query, [])
+        if not keys:
+            continue
+        result[:, query_offset, :len(keys)] = selected_heads[:, query, np.asarray(keys, dtype=np.int64)]
+    return result
+
+
 def _is_torch_tensor(value: Any) -> bool:
     return value.__class__.__module__.split(".", 1)[0] == "torch"
 
@@ -765,10 +1107,10 @@ def _select_positions(
     return selected
 
 
-def _stack_tensors(tensors: list[Any], *, param: str) -> Any:
+def _stack_tensors(tensors: list[Any], *, param: str, empty_name: str = "Hidden-state layer selector") -> Any:
     if not tensors:
         raise InvalidRequestError(
-            "Hidden-state layer selector resolved to no layers.",
+            f"{empty_name} resolved to no layers.",
             code="invalid_selector",
             param=param)
     if all(_is_torch_tensor(tensor) for tensor in tensors):

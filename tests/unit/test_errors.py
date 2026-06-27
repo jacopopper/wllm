@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
+
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server.app import create_app
-from server.errors import unexpected_exception_handler
+from server.errors import http_exception_handler, unexpected_exception_handler
 from tests.unit.test_app import FakeRuntime
 
 
@@ -16,6 +18,7 @@ def test_unexpected_exception_handler_uses_openai_style_500() -> None:
         "error": {
             "message": "Unexpected internal server error.",
             "type": "internal_server_error",
+            "status": 500,
             "param": None,
             "code": "internal_error",
             "details": {},
@@ -26,6 +29,7 @@ def test_unexpected_exception_handler_uses_openai_style_500() -> None:
 def test_app_registers_generic_exception_handler() -> None:
     app = create_app(runtime=FakeRuntime())
     assert app.exception_handlers[Exception] is unexpected_exception_handler
+    assert app.exception_handlers[StarletteHTTPException] is http_exception_handler
 
 
 def test_validation_error_response_sanitizes_non_json_context() -> None:

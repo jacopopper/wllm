@@ -230,13 +230,14 @@ def _client(runtime: Any, *, api_key: str | None = None, limits: ResourceLimits 
 
 
 def _assert_error_envelope(body: dict[str, Any]) -> dict[str, Any]:
-    """Assert the OpenAI-style ``{"error": {...}}`` envelope with all 5 fields."""
+    """Assert the OpenAI-style ``{"error": {...}}`` envelope with all public fields."""
     assert "error" in body, f"missing top-level 'error' envelope in {body}"
     error = body["error"]
-    for field in ("message", "type", "param", "code", "details"):
+    for field in ("message", "type", "status", "param", "code", "details"):
         assert field in error, f"error envelope missing '{field}' in {error}"
     assert isinstance(error["message"], str) and error["message"]
     assert isinstance(error["type"], str) and error["type"]
+    assert isinstance(error["status"], int)
     assert error["param"] is None or isinstance(error["param"], str)
     assert isinstance(error["code"], str) and error["code"]
     return error
@@ -654,6 +655,16 @@ def test_error_envelope_shape_consistent_across_status_codes() -> None:
     with _client(ComplianceRuntime(), api_key="secret") as client:
         cases.append((client.get("/v1/models").status_code, client.get("/v1/models").json()))
 
+    # 404 via unknown endpoint
+    with _client(ComplianceRuntime()) as client:
+        response = client.get("/v1/unknown")
+    cases.append((response.status_code, response.json()))
+
+    # 405 via wrong method
+    with _client(ComplianceRuntime()) as client:
+        response = client.post("/v1/models")
+    cases.append((response.status_code, response.json()))
+
     # 413 via exceeding max_top_k
     with _client(ComplianceRuntime()) as client:
         response = client.post(
@@ -705,12 +716,13 @@ def test_error_envelope_shape_consistent_across_status_codes() -> None:
         response = client.post("/v1/chat/completions", json=_CHAT_PAYLOAD)
     cases.append((response.status_code, response.json()))
 
-    expected = {401, 413, 422, 500, 501, 503}
+    expected = {401, 404, 405, 413, 422, 500, 501, 503}
     observed = {status for status, _ in cases}
     assert observed == expected, f"missing status codes: {expected - observed}, extra: {observed - expected}"
 
     for status, body in cases:
         error = _assert_error_envelope(body)
+        assert error["status"] == status
         assert error["type"] in {
             "authentication_error",
             "resource_limit_exceeded",
@@ -892,6 +904,22 @@ def test_wrong_http_method_returns_405() -> None:
         post_schema = client.post("/v1/extraction-schema")
     for response in (post_models, get_extract, get_chat, post_schema):
         assert response.status_code == 405
+        error = _assert_error_envelope(response.json())
+        assert error["status"] == 405
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "method_not_allowed"
+
+
+def test_unknown_endpoint_returns_404_envelope() -> None:
+    with _client(ComplianceRuntime()) as client:
+        response = client.get("/v1/not-real")
+
+    assert response.status_code == 404
+    error = _assert_error_envelope(response.json())
+    assert error["status"] == 404
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "endpoint_not_found"
+    assert error["details"]["path"] == "/v1/not-real"
 
 
 # ---------------------------------------------------------------------------

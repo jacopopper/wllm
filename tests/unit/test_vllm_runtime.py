@@ -11,6 +11,7 @@ import pytest
 from extractors.planning import RuntimeTopology
 import runtime.vllm_compat as vllm_compat_module
 from runtime.vllm_compat import (
+    OnlineHiddenStateSelection,
     capture_online_hidden_states,
     capture_pooling_hidden_states,
     extract_attention_backend,
@@ -983,6 +984,172 @@ def test_generate_extract_uses_batch_decode_when_tokens_requested(tmp_path) -> N
     assert llm.tokenizer.decode_calls == []
 
 
+def test_attention_extract_requires_runtime_opt_in(tmp_path) -> None:
+    from artifacts.store import ArtifactStore
+    from extractors.planning import ResourceLimits
+
+    runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake"))
+    runtime._imports = FakeImports()
+    runtime._llm = FakeLLM()
+    runtime._topology = RuntimeTopology(num_layers=2, num_attention_heads=2, hidden_size=32)
+
+    with pytest.raises(UnsupportedExtractionError) as exc:
+        runtime.generate_extract(
+            ExtractRequest.model_validate(
+                {
+                    "model": "fake",
+                    "prompt": "hello",
+                    "extract": {
+                        "attentions": [
+                            {
+                                "layers": 0,
+                                "heads": 0,
+                                "query_positions": "last_generated",
+                                "key_positions": "previous_token",
+                            }
+                        ]
+                    },
+                }
+            ),
+            limits=ResourceLimits(),
+            artifact_store=ArtifactStore(tmp_path),
+            persist=False,
+        )
+
+    assert exc.value.code == "attention_weights_unavailable"
+    assert exc.value.param == "extract.attentions"
+    assert runtime._llm.generate_calls == 0
+
+
+def test_generate_extract_replays_attention_weights_when_requested(tmp_path, monkeypatch) -> None:
+    from artifacts.store import ArtifactStore
+    from extractors.planning import ResourceLimits
+
+    replay = object()
+    load_calls: list[dict[str, Any]] = []
+    capture_calls: list[list[int]] = []
+
+    def fake_load(**kwargs: Any) -> object:
+        load_calls.append(kwargs)
+        return replay
+
+    def fake_capture(replay_arg: object, *, token_ids: list[int]) -> dict[int, np.ndarray]:
+        assert replay_arg is replay
+        capture_calls.append(token_ids)
+        return {0: np.arange(2 * 2 * 2, dtype=np.float32).reshape(2, 2, 2)}
+
+    monkeypatch.setattr(vllm_runtime_module, "load_transformers_attention_replay", fake_load)
+    monkeypatch.setattr(vllm_runtime_module, "capture_transformers_replay_attentions", fake_capture)
+    runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake", enable_attention_weights=True, local_files_only=True))
+    runtime._imports = FakeImports()
+    runtime._llm = FakeLLM()
+    runtime._topology = RuntimeTopology(num_layers=2, num_attention_heads=2, hidden_size=32)
+
+    trace = runtime.generate_extract(
+        ExtractRequest.model_validate(
+            {
+                "model": "fake",
+                "prompt": "hello",
+                "extract": {
+                    "attentions": [
+                        {
+                            "layers": 0,
+                            "heads": 0,
+                            "query_positions": "last_generated",
+                            "key_positions": "previous_token",
+                        }
+                    ]
+                },
+            }
+        ),
+        limits=ResourceLimits(),
+        artifact_store=ArtifactStore(tmp_path),
+        persist=False,
+    )
+
+    assert load_calls == [
+        {
+            "model": "fake",
+            "tokenizer": None,
+            "dtype": "auto",
+            "trust_remote_code": False,
+            "local_files_only": True,
+        }
+    ]
+    assert capture_calls == [[1, 2]]
+    assert runtime._llm.generate_calls == 1
+    record = trace.trace.attentions[0]
+    assert record.shape == [1, 1, 1, 1]
+    assert record.data[0][0][0][0] == 2.0
+    assert trace.metadata.capture["attentions"]["capture_metadata"]["backend"] == "transformers_replay"
+
+
+def test_normal_completion_bypasses_attention_replay_when_enabled(monkeypatch) -> None:
+    runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake", enable_attention_weights=True))
+    runtime._imports = FakeImports()
+    runtime._llm = FakeLLM()
+
+    monkeypatch.setattr(
+        vllm_runtime_module,
+        "load_transformers_attention_replay",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("attention replay must not load")),
+    )
+    monkeypatch.setattr(
+        vllm_runtime_module,
+        "capture_transformers_replay_attentions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("attention replay must not run")),
+    )
+
+    response = runtime.generate_completion(
+        CompletionRequest.model_validate({"model": "fake", "prompt": "hello", "max_tokens": 1})
+    )
+
+    assert response["choices"][0]["text"] == "ok"
+    assert runtime._llm.generate_calls == 1
+    assert runtime._attention_replay is None
+
+
+def test_attention_replay_memory_limit_is_checked_before_loading_replay(tmp_path, monkeypatch) -> None:
+    from artifacts.store import ArtifactStore
+    from extractors.planning import ResourceLimits
+
+    runtime = VLLMRuntime(VLLMRuntimeConfig(model="fake", enable_attention_weights=True))
+    runtime._imports = FakeImports()
+    runtime._llm = FakeLLM()
+    runtime._topology = RuntimeTopology(num_layers=2, num_attention_heads=2, hidden_size=32)
+    monkeypatch.setattr(
+        vllm_runtime_module,
+        "load_transformers_attention_replay",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("replay should not load over limit")),
+    )
+
+    with pytest.raises(ResourceLimitError) as exc:
+        runtime.generate_extract(
+            ExtractRequest.model_validate(
+                {
+                    "model": "fake",
+                    "prompt": "hello",
+                    "extract": {
+                        "attentions": [
+                            {
+                                "layers": 0,
+                                "heads": 0,
+                                "query_positions": "last_generated",
+                                "key_positions": "previous_token",
+                            }
+                        ]
+                    },
+                }
+            ),
+            limits=ResourceLimits(max_total_captured_tensor_bytes=31, max_inline_tensor_bytes=1024),
+            artifact_store=ArtifactStore(tmp_path),
+            persist=False,
+        )
+
+    assert exc.value.param == "extract.attentions"
+    assert exc.value.details["estimated_raw_capture_bytes"] == 64
+
+
 def test_hidden_only_extract_skips_token_decoding(tmp_path) -> None:
     from artifacts.store import ArtifactStore
     from extractors.planning import ResourceLimits
@@ -1320,6 +1487,50 @@ def test_capture_online_hidden_states_can_slice_dense_prefix_before_copy() -> No
     assert all(not layer.hooks for layer in llm.model.model.layers)
 
 
+def test_capture_online_hidden_states_can_select_and_pool_on_worker() -> None:
+    llm = FakeOnlineLLM()
+
+    def generate() -> str:
+        for layer in llm.model.model.layers:
+            layer.emit(3)
+        return "ok"
+
+    capture = capture_online_hidden_states(
+        llm,
+        layers=[0, 3],
+        generate=generate,
+        select_hidden_states=lambda _output: [
+            OnlineHiddenStateSelection(
+                name="hidden_states_0",
+                layers=[0, 3],
+                positions=[1, 2],
+                pool="mean",
+            ),
+            OnlineHiddenStateSelection(
+                name="hidden_states_1",
+                layers=[3],
+                positions=[2],
+                pool=None,
+            ),
+        ],
+    )
+
+    assert capture.output == "ok"
+    assert capture.tensors == {}
+    assert capture.selected_tensors["hidden_states_0"].shape == (2, 32)
+    assert capture.selected_tensors["hidden_states_0"][0, 0] == 48.0
+    assert capture.selected_tensors["hidden_states_0"][1, 0] == 3048.0
+    assert capture.selected_tensors["hidden_states_1"].shape == (1, 1, 32)
+    assert capture.selected_tensors["hidden_states_1"][0, 0, 0] == 3064.0
+    assert capture.metadata["selection_mode"] == "worker_selected"
+    assert capture.metadata["selected_tensor_shapes"] == {
+        "hidden_states_0": [2, 32],
+        "hidden_states_1": [1, 1, 32],
+    }
+    assert capture.metadata["layer_chunk_shapes"]["0"] == [[3, 32]]
+    assert all(not layer.hooks for layer in llm.model.model.layers)
+
+
 def test_capture_online_hidden_states_removes_hooks_after_generation_failure() -> None:
     llm = FakeOnlineLLM()
 
@@ -1405,6 +1616,8 @@ def test_generate_extract_uses_online_hooks_for_hidden_states(tmp_path) -> None:
     assert record.position_semantics["decoder_only_prediction_semantics"]
     assert record.position_semantics["source_positions"] == [0]
     assert record.capture_metadata["hook_scope"] == "active_generation_runner"
+    assert record.capture_metadata["selection_mode"] == "worker_selected"
+    assert record.capture_metadata["selected_tensor_shapes"] == {"hidden_states_0": [1, 1, 32]}
     assert record.shape == [1, 1, 32]
     assert record.data[0][0][:3] == [11000.0, 11001.0, 11002.0]
     assert trace.metadata.resolved_selectors["hidden_states"][0]["capture_mode"] == "online"

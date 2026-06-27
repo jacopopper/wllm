@@ -4,9 +4,9 @@ OpenAI-compatible vLLM serving with opt-in white-box traces.
 
 wllm runs normal chat and completion requests through vLLM, while adding a small
 set of researcher-oriented endpoints for extracting token IDs, logprobs, hidden
-states, and persisted tensor artifacts. Extraction is explicit: standard
-generation requests do not allocate collectors, install hooks, or write
-artifacts.
+states, experimental replay attention weights, and persisted tensor artifacts.
+Extraction is explicit: standard generation requests do not allocate collectors,
+install hooks, run replay models, or write artifacts.
 
 ## Why wllm?
 
@@ -33,8 +33,8 @@ wllm is an early `0.1.0` release.
 | Extraction endpoints | `/v1/extract`, `/v1/traces`, `/v1/extraction-schema` |
 | Streaming | not supported |
 | Hidden states | conditional, single GPU |
-| Attention weights | not supported |
-| Tests | 361 unit tests plus GPU integration smoke tests |
+| Attention weights | experimental, replay-only opt-in |
+| Tests | unit tests plus GPU integration smoke tests |
 
 The vLLM version is pinned intentionally. Hidden-state extraction relies on
 private vLLM internals, all isolated in `src/runtime/vllm_compat.py`. Mismatched
@@ -59,6 +59,42 @@ Optional PT artifact loading/saving uses PyTorch:
 ```bash
 pip install -e '.[vllm,artifacts-pt]'
 ```
+
+## Preflight
+
+Before running long extraction jobs, check the environment explicitly:
+
+1. Run the built-in preflight command:
+
+   ```bash
+   wllm doctor --model Qwen/Qwen3-0.6B --local-files-only
+   ```
+
+   `doctor` checks the Python environment, installed `wllm` metadata, exact
+   vLLM version, optional PyTorch/Transformers packages, and local path-like
+   model arguments. It does not initialize a model or download files.
+
+2. Confirm the serving dependency set is installed:
+
+   ```bash
+   python -c "import vllm; print(vllm.__version__)"
+   ```
+
+   The supported vLLM version is exactly `0.10.2`.
+
+3. If the model is already cached or local, start with `--local-files-only` to
+   avoid unexpected downloads.
+
+4. For replay hidden states, use `--tensor-parallel-size 1` and configure
+   `--gpu-memory-utilization 0.5` or lower so the isolated replay runner has
+   room to initialize.
+
+5. Query `/v1/extraction-schema` after startup and inspect `capabilities` and
+   `limits` before sending large hidden-state or attention requests.
+
+6. For attention replay, install the debug Transformers stack and start with
+   `--enable-attention-weights`. Treat this path as experimental and prefer
+   artifact-backed requests.
 
 ## Quickstart
 
@@ -119,7 +155,7 @@ Common options:
 | `--host`, `--port` | Bind address. |
 | `--dtype` | vLLM dtype, for example `auto`, `float16`, or `bfloat16`. |
 | `--tensor-parallel-size` | Tensor parallel size. Hidden-state extraction currently requires `1`. |
-| `--gpu-memory-utilization` | vLLM GPU memory utilization. Replay hidden states require `<= 0.5`. |
+| `--gpu-memory-utilization` | vLLM GPU memory utilization in `(0.0, 1.0]`. Replay hidden states require `<= 0.5`. |
 | `--max-model-len` | Maximum model context length passed to vLLM. |
 | `--tokenizer` | Optional tokenizer name or path. |
 | `--served-model-name` | Model name returned by `/v1/models` and generation responses. |
@@ -130,6 +166,15 @@ Common options:
 | `--artifact-dir` | Directory for trace bundles and tensor artifacts. |
 | `--prewarm-hidden-states` | Initialize the replay hidden-state runner at startup. |
 | `--enable-online-hidden-states` | Enable online hidden-state capture during generation. |
+| `--enable-attention-weights` | Enable experimental replay-only attention extraction. |
+| `--max-top-k` | Maximum `extract.logprobs.top_k`. |
+| `--max-selected-layers` | Maximum selected layers per tensor request unless large extraction is enabled. |
+| `--max-selected-heads` | Maximum selected attention heads per request unless large extraction is enabled. |
+| `--max-selected-positions` | Maximum selected token positions per tensor request unless large extraction is enabled. |
+| `--max-inline-tensor-bytes` | Maximum estimated tensor bytes returned inline in a trace response. |
+| `--max-total-captured-tensor-bytes` | Maximum estimated tensor bytes captured for one extraction request. |
+| `--max-artifact-bytes` | Maximum serialized byte size for one artifact or trace bundle. |
+| `--enable-large-extraction` | Allow artifact-backed requests that exceed default selector-count limits. |
 
 wllm accepts a focused subset of `vllm serve` options. Unsupported vLLM flags are
 rejected instead of being ignored.
@@ -238,6 +283,51 @@ Online mode avoids the replay pass, but it starts the generation runner in eager
 in-process mode with prefix caching disabled. It is not numerically
 interchangeable with replay mode; choose the mode that matches your experiment.
 
+### Attention Weights
+
+Attention extraction is experimental and disabled by default. When enabled, wllm
+still generates normally with vLLM, then replays the final
+`prompt_token_ids + generated_token_ids` through a separate Transformers/PyTorch
+model with `output_attentions=True` and `use_cache=False`. The replay path
+requires `torch` and `transformers`; missing dependencies are reported as
+structured `attention_weights_unavailable` errors.
+
+```bash
+wllm serve Qwen/Qwen3-0.6B --enable-attention-weights
+```
+
+Artifact-backed attention traces are recommended because attention tensors scale
+with sequence length squared:
+
+```bash
+curl http://localhost:8000/v1/traces \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "prompt": "Explain calibration briefly.",
+    "max_tokens": 32,
+    "extract": {
+      "attentions": [
+        {
+          "layers": "middle",
+          "heads": [0, 1],
+          "query_positions": "generated",
+          "key_positions": "previous_token"
+        }
+      ],
+      "artifacts": {
+        "format": "npz",
+        "include": ["attentions"]
+      }
+    }
+  }'
+```
+
+The replay path is memory-heavy and may differ from fused vLLM decode internals.
+It is intended for bounded research traces, not low-latency serving. Online
+attention capture from the active vLLM generation path is explicitly out of
+scope.
+
 ### Selectors
 
 | Selector | Accepted values |
@@ -313,6 +403,7 @@ Trace responses use `wllm.trace.v1`.
 | `trace.spans` | Prompt/generated spans. |
 | `trace.logprobs` | Selected logprobs and top-k alternatives. |
 | `trace.hidden_states` | Tensor records or artifact references. |
+| `trace.attentions` | Replay attention tensor records or artifact references. |
 | `trace_manifest` | Persisted JSON bundle manifest for `/v1/traces`. |
 | `artifacts` | Tensor artifact manifests. |
 | `metadata` | Sampling params, capabilities, resolved selectors, and timings. |
@@ -333,6 +424,7 @@ Validated on Linux with RTX 5090 24 GB, vLLM 0.10.2, PyTorch 2.8.0+cu128,
 | Hidden-state replay | yes | yes | no, VRAM |
 | Hidden-state online | yes | yes | no, VRAM |
 | Prewarmed replay | yes | yes | no, VRAM |
+| Attention replay | experimental | experimental | experimental, memory-heavy |
 | NPZ artifacts | yes | yes | yes, token/logprob tested |
 | PT artifacts | yes | yes | yes, token/logprob tested |
 
@@ -361,11 +453,24 @@ tokens, warm runs.
 | wllm hidden NPZ, uncompressed | 128.3 ms | 1.41x |
 | wllm hidden PT | 128.2 ms | 1.41x |
 
+Attention replay spot check: Qwen3-0.6B, RTX 5090 Laptop GPU, vLLM 0.10.2,
+PyTorch 2.8.0+cu128, Transformers 5.12.1, `max_model_len=512`, bfloat16,
+batch size 1, short prompt, 8 generated tokens, 3 measured runs.
+
+| Mode | Median wall time | vs wllm completion | Generation ms | Replay capture ms | Serialization ms |
+|---|---:|---:|---:|---:|---:|
+| wllm completion, trace-free | 23.1 ms | 1.00x | - | - | - |
+| Attention inline, 1 layer/2 heads/last query | 39.0 ms | 1.69x | 23.0 ms | 15.8 ms | 0.1 ms |
+| Attention NPZ, 1 layer/2 heads/generated queries | 35.3 ms | 1.53x | 23.4 ms | 10.3 ms | 0.6 ms |
+
 Takeaways:
 
 - Normal generation stays near raw vLLM speed.
 - Token and top-k logprob extraction are low overhead for small batch sizes.
 - Replay hidden-state capture adds the cost of a second vLLM pass.
+- Replay attention capture is no longer CPU-bound when CUDA is available, but it
+  still adds a second Transformers forward pass and scales quadratically with
+  sequence length.
 - Uncompressed NPZ and PT reduce serialization latency at the cost of different
   storage tradeoffs.
 
@@ -387,6 +492,18 @@ python scripts/dataset_workflow.py \
   --model Qwen/Qwen3-0.6B
 ```
 
+Each prompt file line must be a JSON object with a non-empty `prompt` string:
+
+```json
+{"id": "calibration-1", "prompt": "Explain calibration briefly."}
+```
+
+Malformed JSON, non-object rows, and missing or empty `prompt` fields stop the
+workflow before any server requests are sent. Output rows include `id`,
+`prompt`, `trace_id`, `token_count`, `generated_token_count`, `artifact_count`,
+`adapter_name`, `adapter_status`, and `adapter_values`; failed rows include an
+`error` field instead.
+
 Research adapters live under `src/research/`. They consume `TraceEnvelope`
 objects and artifact tensors; they do not add server routes or paper-specific
 request fields.
@@ -406,7 +523,21 @@ Default server-side limits:
 | `max_artifact_bytes` | 256 MB |
 | `large_extraction_enabled` | false |
 
+These defaults can be changed at server startup with the corresponding
+`wllm serve` flags: `--max-top-k`, `--max-selected-layers`,
+`--max-selected-heads`, `--max-selected-positions`,
+`--max-inline-tensor-bytes`, `--max-total-captured-tensor-bytes`,
+`--max-artifact-bytes`, and `--enable-large-extraction`. The active values are
+reported by `/v1/extraction-schema` so client scripts can adapt before sending
+large extraction requests.
+
 Requests exceeding limits return HTTP 413 with an OpenAI-style error envelope.
+
+The active vLLM generation runner is serialized inside one `VLLMRuntime`
+instance. Concurrent HTTP requests are accepted by FastAPI, but calls that use
+the shared generation runner are queued so vLLM scheduler state and online
+hidden-state hooks cannot overlap. Replay hidden states, attention replay, and
+artifact writes use their own scoped locks.
 
 ## Error Handling
 
@@ -417,6 +548,7 @@ All API errors use an OpenAI-style envelope:
   "error": {
     "message": "Human-readable description.",
     "type": "invalid_request_error",
+    "status": 422,
     "param": null,
     "code": "schema_validation_failed",
     "details": {}
@@ -429,6 +561,8 @@ Common error classes:
 | HTTP | Type | Examples |
 |---:|---|---|
 | 401 | `authentication_error` | Invalid or missing API key. |
+| 404 | `invalid_request_error` | Unknown endpoint. |
+| 405 | `invalid_request_error` | Wrong HTTP method for an endpoint. |
 | 413 | `resource_limit_exceeded` | Extraction exceeds configured limits. |
 | 422 | `invalid_request_error` | Schema errors, streaming requested, unsupported sampling field. |
 | 501 | `unsupported_extraction` | Hidden states unavailable, attention weights unavailable, exact entropy unavailable. |
@@ -444,6 +578,8 @@ wllm is a drop-in replacement for common non-streaming OpenAI-compatible
 Supported CLI surface:
 
 ```text
+doctor
+serve
 --host
 --port
 --dtype
@@ -459,12 +595,21 @@ Supported CLI surface:
 --artifact-dir
 --prewarm-hidden-states
 --enable-online-hidden-states
+--enable-attention-weights
+--max-top-k
+--max-selected-layers
+--max-selected-heads
+--max-selected-positions
+--max-inline-tensor-bytes
+--max-total-captured-tensor-bytes
+--max-artifact-bytes
+--enable-large-extraction
 --log-level
 ```
 
 Not supported in `0.1.0`: streaming, quantization flags, LoRA, speculative
 decoding, multimodal inputs, tool calling, structured outputs, reasoning parsers,
-pipeline parallelism, custom chat templates, attention weight extraction, raw
+pipeline parallelism, custom chat templates, online attention capture, raw
 logits, and exact entropy.
 
 ## Development
@@ -490,11 +635,31 @@ Run the smoke benchmark:
 python scripts/benchmark_smoke.py /path/to/local/model --local-files-only
 ```
 
+Plan or run the fuller latency suite:
+
+```bash
+python scripts/latency_suite.py --model /path/to/local/model --profile quick --dry-run
+python scripts/latency_suite.py --model /path/to/local/model --profile quick --local-files-only
+```
+
+The latency suite compares raw vLLM generation, trace-free wllm completions,
+token/logprob extraction, hidden-state capture, and experimental attention
+replay cases. Generated latency and attention reports under `reports/` are local
+benchmark outputs and are ignored by git unless intentionally curated.
+
+Curated release evidence lives in:
+
+- `reports/wllm_multi_architecture_validation_report.md`
+- `reports/wllm_multi_architecture_validation_results.json`
+- `reports/release-v0.1-readiness.md`
+
 Build package artifacts:
 
 ```bash
 python -m build
 ```
+
+Release notes for the first usable version are in `CHANGELOG.md`.
 
 ## Project Layout
 
@@ -521,7 +686,8 @@ scripts/
 - Replay hidden states require enough VRAM for a second vLLM runner.
 - Online hidden states use a different execution path from replay and should not
   be treated as numerically equivalent.
-- Attention weights are not exposed by the current vLLM path.
+- Attention weights are available only through opt-in Transformers replay, not
+  from the current vLLM serving path.
 - Raw logits and exact entropy are not available from vLLM generation outputs.
 - Artifact writes are synchronous on the request path.
 - Authentication is limited to one static API key.

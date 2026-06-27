@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -166,3 +169,254 @@ def test_one_line_load_trace_bundle_with_manifest(tmp_path) -> None:
     loaded = load_trace_bundle(tmp_path, trace.trace_manifest)
     assert loaded.id == trace.id
     assert loaded.trace.tokens.token_ids is not None
+
+
+# ---------------------------------------------------------------------------
+# Dataset workflow example helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_dataset_workflow_module():
+    root = Path(__file__).resolve().parent.parent.parent
+    path = root / "scripts" / "dataset_workflow.py"
+    spec = importlib.util.spec_from_file_location("dataset_workflow", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dataset_workflow_read_prompts_returns_valid_entries(tmp_path) -> None:
+    workflow = _load_dataset_workflow_module()
+    prompt_file = tmp_path / "prompts.jsonl"
+    prompt_file.write_text(
+        "\n".join(
+            [
+                '{"id": "ok", "prompt": "Explain calibration."}',
+                "",
+                '{"id": "ok2", "prompt": "Explain uncertainty."}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    prompts = workflow.read_prompts(prompt_file)
+
+    assert prompts == [
+        {"id": "ok", "prompt": "Explain calibration."},
+        {"id": "ok2", "prompt": "Explain uncertainty."},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        ('{"id": "missing"}', "missing non-empty 'prompt' string"),
+        ('{"id": "empty", "prompt": ""}', "missing non-empty 'prompt' string"),
+        ("not-json", "malformed JSONL entry"),
+        ('["not", "an", "object"]', "expected a JSON object"),
+    ],
+)
+def test_dataset_workflow_read_prompts_rejects_bad_records(tmp_path, line: str, message: str) -> None:
+    workflow = _load_dataset_workflow_module()
+    prompt_file = tmp_path / "prompts.jsonl"
+    prompt_file.write_text(line, encoding="utf-8")
+
+    with pytest.raises(workflow.PromptFileError, match=message):
+        workflow.read_prompts(prompt_file)
+
+
+def test_dataset_workflow_read_prompts_rejects_missing_file(tmp_path) -> None:
+    workflow = _load_dataset_workflow_module()
+
+    with pytest.raises(workflow.PromptFileError, match="Could not read prompts file"):
+        workflow.read_prompts(tmp_path / "missing.jsonl")
+
+
+def test_dataset_workflow_read_prompts_rejects_invalid_utf8(tmp_path) -> None:
+    workflow = _load_dataset_workflow_module()
+    prompt_file = tmp_path / "prompts.jsonl"
+    prompt_file.write_bytes(b"\x80\x81\x82")
+
+    with pytest.raises(workflow.PromptFileError, match="not valid UTF-8"):
+        workflow.read_prompts(prompt_file)
+
+
+def test_dataset_workflow_main_reports_prompt_file_errors(tmp_path, monkeypatch, capsys) -> None:
+    workflow = _load_dataset_workflow_module()
+    missing = tmp_path / "missing.jsonl"
+    monkeypatch.setattr(sys, "argv", ["dataset_workflow.py", "--prompts", str(missing)])
+
+    rc = workflow.main()
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Prompt file error:" in captured.err
+    assert str(missing) in captured.err
+
+
+def test_dataset_workflow_main_preserves_rows_when_adapter_fails(tmp_path, monkeypatch) -> None:
+    workflow = _load_dataset_workflow_module()
+    prompt_file = tmp_path / "prompts.jsonl"
+    output_file = tmp_path / "results.jsonl"
+    prompt_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "ok", "prompt": "first prompt"}),
+                json.dumps({"id": "boom", "prompt": "second prompt"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class AdapterResult:
+        name = "token_baselines"
+        status = "ok"
+        values = {"token_count": 3}
+
+    client = Client()
+    adapter_calls = 0
+
+    def fake_extract_trace(client_arg, **kwargs):
+        assert client_arg is client
+        return {"trace_manifest": {"path": f"{kwargs['prompt']}.json"}, "artifacts": []}
+
+    def fake_run_adapter(trace):
+        nonlocal adapter_calls
+        adapter_calls += 1
+        if adapter_calls == 2:
+            raise RuntimeError("adapter boom")
+        return AdapterResult()
+
+    monkeypatch.setattr(workflow, "_get_client", lambda: client)
+    monkeypatch.setattr(workflow, "extract_trace", fake_extract_trace)
+    monkeypatch.setattr(workflow, "load_trace_and_artifacts", lambda artifact_dir, response: (make_trace(), {}))
+    monkeypatch.setattr(workflow, "run_adapter", fake_run_adapter)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dataset_workflow.py", "--prompts", str(prompt_file), "--output", str(output_file), "--model", "fake"],
+    )
+
+    rc = workflow.main()
+
+    rows = [json.loads(line) for line in output_file.read_text(encoding="utf-8").splitlines()]
+    assert rc == 0
+    assert client.closed
+    assert [row["id"] for row in rows] == ["ok", "boom"]
+    assert rows[0]["adapter_status"] == "ok"
+    assert rows[1]["trace_id"] == "trace_1"
+    assert rows[1]["error"] == "adapter: adapter boom"
+
+
+def test_dataset_workflow_extract_trace_builds_expected_request_body() -> None:
+    workflow = _load_dataset_workflow_module()
+
+    class Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {"trace_manifest": {"path": "trace.json"}, "artifacts": []}
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def post(self, path: str, json: dict[str, object]) -> Response:
+            self.calls.append((path, json))
+            return Response()
+
+    client = Client()
+
+    response = workflow.extract_trace(
+        client,
+        prompt="hello",
+        model="fake",
+        max_tokens=8,
+        include_logprobs=True,
+        include_hidden_states=True,
+        top_k=3,
+    )
+
+    assert response["artifacts"] == []
+    assert client.calls[0][0] == "/traces"
+    body = client.calls[0][1]
+    assert body["model"] == "fake"
+    assert body["prompt"] == "hello"
+    assert body["max_tokens"] == 8
+    extract = body["extract"]
+    assert extract["tokens"] is True
+    assert extract["logprobs"] == {"top_k": 3, "include_prompt": True}
+    assert extract["hidden_states"] == [{"layers": "middle", "positions": "last_generated"}]
+    assert extract["artifacts"] == {"format": "npz", "include": ["logprobs", "hidden_states"]}
+
+
+def test_dataset_workflow_extract_trace_can_request_tokens_only() -> None:
+    workflow = _load_dataset_workflow_module()
+
+    class Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {"trace_manifest": {"path": "trace.json"}, "artifacts": []}
+
+    class Client:
+        def __init__(self) -> None:
+            self.body: dict[str, object] | None = None
+
+        def post(self, path: str, json: dict[str, object]) -> Response:
+            del path
+            self.body = json
+            return Response()
+
+    client = Client()
+    workflow.extract_trace(client, prompt="hello", model="fake", max_tokens=8, include_logprobs=False)
+
+    assert client.body is not None
+    assert client.body["extract"] == {"tokens": True}
+
+
+def test_dataset_workflow_error_message_prefers_openai_error_envelope() -> None:
+    workflow = _load_dataset_workflow_module()
+
+    class Response:
+        status_code = 413
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"error": {"code": "extraction_limit_exceeded", "message": "too large"}}
+
+    class HTTPError(Exception):
+        response = Response()
+
+    assert workflow.error_message(HTTPError("raw")) == "extraction_limit_exceeded: too large"
+
+
+def test_dataset_workflow_build_result_uses_generated_span() -> None:
+    workflow = _load_dataset_workflow_module()
+
+    class AdapterResult:
+        name = "token_baselines"
+        status = "ok"
+        values = {"token_count": 3}
+
+    result = workflow.build_result(
+        {"id": "p1", "prompt": "hello"},
+        {"trace_manifest": {}},
+        make_trace(),
+        {"art.npz": {}},
+        AdapterResult(),
+    )
+
+    assert result["id"] == "p1"
+    assert result["trace_id"] == "trace_1"
+    assert result["generated_token_count"] == 2
+    assert result["artifact_count"] == 1

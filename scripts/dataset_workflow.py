@@ -17,6 +17,13 @@ The script can also be used with an already-running server:
 
 Requirements (install wllm with vllm extra):
     pip install -e '.[vllm,test]'
+
+Input JSONL:
+    {"id": "q1", "prompt": "Explain calibration briefly."}
+
+Output JSONL fields:
+    id, prompt, trace_id, token_count, generated_token_count, artifact_count,
+    adapter_name, adapter_status, adapter_values, or error.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -32,11 +40,11 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 
-def _get_client():
+def _get_client(base_url: str | None = None):
     """Return an httpx client targeting the wllm server."""
     import httpx
 
-    base_url = os.environ.get("WLLM_BASE_URL", "http://localhost:8100/v1")
+    base_url = base_url or os.environ.get("WLLM_BASE_URL", "http://localhost:8100/v1")
     return httpx.Client(base_url=base_url, timeout=60.0)
 
 
@@ -45,28 +53,43 @@ def _get_client():
 # ---------------------------------------------------------------------------
 
 
-def read_prompts(path: str) -> list[dict[str, Any]]:
+class PromptFileError(ValueError):
+    """Raised when a prompt JSONL file cannot be used as a dataset input."""
+
+
+def read_prompts(path: str | Path) -> list[dict[str, Any]]:
     """Read prompts from a JSONL file.
 
     Each line must be a JSON object with at least a ``prompt`` key.
     Example line:
         {"prompt": "Explain the chain-of-thought reasoning process.", "id": "q1"}
     """
+    prompt_path = Path(path)
     prompts: list[dict[str, Any]] = []
-    with open(path) as fh:
-        for line_num, line in enumerate(fh, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError as exc:
-                print(f"Skipping line {line_num}: {exc}")
-                continue
-            if "prompt" not in entry:
-                print(f"Skipping line {line_num}: missing 'prompt' key")
-                continue
-            prompts.append(entry)
+    try:
+        fh = prompt_path.open(encoding="utf-8")
+    except OSError as exc:
+        raise PromptFileError(f"Could not read prompts file {prompt_path}: {exc}") from exc
+    try:
+        with fh:
+            for line_num, raw_line in enumerate(fh, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise PromptFileError(
+                        f"{prompt_path}:{line_num}: malformed JSONL entry: {exc.msg} at column {exc.colno}"
+                    ) from exc
+                if not isinstance(entry, dict):
+                    raise PromptFileError(f"{prompt_path}:{line_num}: expected a JSON object")
+                prompt = entry.get("prompt")
+                if not isinstance(prompt, str) or not prompt:
+                    raise PromptFileError(f"{prompt_path}:{line_num}: missing non-empty 'prompt' string")
+                prompts.append(entry)
+    except UnicodeDecodeError as exc:
+        raise PromptFileError(f"{prompt_path}: prompt file is not valid UTF-8: {exc}") from exc
     return prompts
 
 
@@ -75,9 +98,9 @@ def extract_trace(
     prompt: str,
     model: str,
     max_tokens: int,
-    artifact_dir: str,
     include_logprobs: bool = True,
     include_hidden_states: bool = False,
+    top_k: int = 5,
 ) -> dict[str, Any]:
     """Send a single extraction request to /v1/traces.
 
@@ -89,7 +112,7 @@ def extract_trace(
     artifacts_include: list[str] = []
 
     if include_logprobs:
-        extract["logprobs"] = {"top_k": 5, "include_prompt": True}
+        extract["logprobs"] = {"top_k": top_k, "include_prompt": True}
         artifacts_include.append("logprobs")
 
     if include_hidden_states:
@@ -109,6 +132,27 @@ def extract_trace(
     resp = client.post("/traces", json=body)
     resp.raise_for_status()
     return resp.json()
+
+
+def error_message(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            if code and message:
+                return f"{code}: {message}"
+            if message:
+                return str(message)
+    status_code = getattr(response, "status_code", None)
+    return f"HTTP {status_code}: {exc}" if status_code is not None else str(exc)
 
 
 def load_trace_and_artifacts(
@@ -159,7 +203,7 @@ def build_result(
         "prompt": prompt_entry["prompt"][:120],
         "trace_id": trace.id,
         "token_count": len(token_ids),
-        "generated_token_count": max(0, trace.trace.spans.get("generated", (0, 0))[1] - trace.trace.spans.get("generated", (0, 0))[0]),
+        "generated_token_count": generated_token_count(trace),
         "artifact_count": len(artifact_tensors),
         "adapter_name": adapter_result.name,
         "adapter_status": adapter_result.status,
@@ -167,77 +211,117 @@ def build_result(
     }
 
 
+def generated_token_count(trace) -> int:
+    generated_span = trace.trace.spans.get("generated", (0, 0))
+    return max(0, generated_span[1] - generated_span[0])
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid positive int value: {value!r}")
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"value must be positive, got {parsed}")
+    return parsed
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="wllm dataset-building workflow example")
     parser.add_argument("--prompts", required=True, help="Path to JSONL prompts file")
     parser.add_argument("--output", default="results.jsonl", help="Path to output JSONL results file")
     parser.add_argument("--model", default=os.environ.get("WLLM_MODEL", "Qwen/Qwen3-0.6B"), help="Model ID or path")
-    parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens per generation")
+    parser.add_argument("--max-tokens", type=positive_int, default=64, help="Max tokens per generation")
     parser.add_argument("--artifact-dir", default="./wllm-artifacts", help="Directory for trace artifacts")
-    parser.add_argument("--include-logprobs", action="store_true", default=True, help="Include logprob extraction")
+    parser.add_argument("--include-logprobs", dest="include_logprobs", action="store_true", help="Include logprob extraction")
+    parser.add_argument("--no-logprobs", dest="include_logprobs", action="store_false", help="Extract token IDs only")
+    parser.set_defaults(include_logprobs=True)
+    parser.add_argument("--top-k", type=positive_int, default=5, help="Top-k logprobs to request when logprobs are enabled")
     parser.add_argument("--include-hidden-states", action="store_true", default=False, help="Include hidden-state extraction")
     args = parser.parse_args()
 
     # Step 1: Read prompts
-    prompts = read_prompts(args.prompts)
+    try:
+        prompts = read_prompts(args.prompts)
+    except PromptFileError as exc:
+        print(f"Prompt file error: {exc}", file=sys.stderr)
+        return 1
     if not prompts:
         print("No prompts loaded. Provide a JSONL file with at least one line containing a 'prompt' key.")
-        return
+        return 1
     print(f"Loaded {len(prompts)} prompts from {args.prompts}")
 
     # Step 2: Extract traces for each prompt
     client = _get_client()
     results: list[dict[str, Any]] = []
 
-    for i, entry in enumerate(prompts):
-        prompt_text = entry["prompt"]
-        print(f"[{i + 1}/{len(prompts)}] {prompt_text[:60]}...", end=" ", flush=True)
+    try:
+        for i, entry in enumerate(prompts):
+            prompt_text = entry["prompt"]
+            print(f"[{i + 1}/{len(prompts)}] {prompt_text[:60]}...", end=" ", flush=True)
 
-        try:
-            trace_response = extract_trace(
-                client,
-                prompt=prompt_text,
-                model=args.model,
-                max_tokens=args.max_tokens,
-                artifact_dir=args.artifact_dir,
-                include_logprobs=args.include_logprobs,
-                include_hidden_states=args.include_hidden_states,
-            )
-        except Exception as exc:
-            print(f"FAILED: {exc}")
-            results.append({"id": entry.get("id"), "prompt": prompt_text[:120], "error": str(exc)})
-            continue
+            try:
+                trace_response = extract_trace(
+                    client,
+                    prompt=prompt_text,
+                    model=args.model,
+                    max_tokens=args.max_tokens,
+                    include_logprobs=args.include_logprobs,
+                    include_hidden_states=args.include_hidden_states,
+                    top_k=args.top_k,
+                )
+            except Exception as exc:
+                message = error_message(exc)
+                print(f"FAILED: {message}")
+                results.append({"id": entry.get("id"), "prompt": prompt_text[:120], "error": message})
+                continue
 
-        # Step 3: Load trace bundle and artifacts
-        try:
-            trace, artifact_tensors = load_trace_and_artifacts(args.artifact_dir, trace_response)
-        except Exception as exc:
-            print(f"LOAD FAILED: {exc}")
-            results.append({"id": entry.get("id"), "prompt": prompt_text[:120], "error": f"load: {exc}"})
-            continue
+            # Step 3: Load trace bundle and artifacts
+            try:
+                trace, artifact_tensors = load_trace_and_artifacts(args.artifact_dir, trace_response)
+            except Exception as exc:
+                message = error_message(exc)
+                print(f"LOAD FAILED: {message}")
+                results.append({"id": entry.get("id"), "prompt": prompt_text[:120], "error": f"load: {message}"})
+                continue
 
-        # Step 4: Run research adapter
-        adapter_result = run_adapter(trace)
-        print(f"→ {adapter_result.status} ({adapter_result.values})")
+            # Step 4: Run research adapter
+            try:
+                adapter_result = run_adapter(trace)
+                result = build_result(entry, trace_response, trace, artifact_tensors, adapter_result)
+            except Exception as exc:
+                message = error_message(exc)
+                print(f"ADAPTER FAILED: {message}")
+                results.append(
+                    {
+                        "id": entry.get("id"),
+                        "prompt": prompt_text[:120],
+                        "trace_id": getattr(trace, "id", None),
+                        "error": f"adapter: {message}",
+                    }
+                )
+                continue
 
-        result = build_result(entry, trace_response, trace, artifact_tensors, adapter_result)
-        results.append(result)
-
-    client.close()
+            print(f"-> {adapter_result.status} ({adapter_result.values})")
+            results.append(result)
+    finally:
+        client.close()
 
     # Step 5: Save results
     output_path = Path(args.output)
-    with output_path.open("w") as fh:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fh:
         for r in results:
             json.dump(r, fh)
             fh.write("\n")
     print(f"Saved {len(results)} results to {output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

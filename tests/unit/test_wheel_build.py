@@ -93,6 +93,16 @@ def test_wheel_entry_point_resolves(built_wheel, tmp_path) -> None:
     assert help_run.returncode == 0, f"wllm --help failed:\n{help_run.stderr}"
     assert "wllm" in help_run.stdout
     assert "serve" in help_run.stdout
+    assert "doctor" in help_run.stdout
+
+    doctor_help = subprocess.run(
+        [str(venv_wllm), "doctor", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert doctor_help.returncode == 0, f"wllm doctor --help failed:\n{doctor_help.stderr}"
+    assert "Check the local wllm/vLLM environment" in doctor_help.stdout
 
     # Running cli.main(['--help']) from the installed wheel must not import vllm/torch
     probe = subprocess.run(

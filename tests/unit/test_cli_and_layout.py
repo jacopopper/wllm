@@ -52,6 +52,14 @@ def test_serve_command_parses_local_files_only() -> None:
     assert args.local_files_only is True
 
 
+def test_doctor_command_parses_model_and_json_flags() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(["doctor", "--model", "./local-model", "--local-files-only", "--json"])
+    assert args.model == "./local-model"
+    assert args.local_files_only is True
+    assert args.json is True
+
+
 def test_no_src_wllm_package() -> None:
     assert not Path("src/wllm").exists()
 
@@ -66,6 +74,14 @@ def test_vllm_extra_targets_tested_vllm_line() -> None:
     assert 'vllm = ["vllm==0.10.2"]' in pyproject
 
 
+def test_sdist_includes_release_notes_and_curated_reports() -> None:
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert '"CHANGELOG.md"' in pyproject
+    assert '"reports/release-v0.1-readiness.md"' in pyproject
+    assert '"reports/wllm_multi_architecture_validation_report.md"' in pyproject
+    assert '"reports/wllm_multi_architecture_validation_results.json"' in pyproject
+
+
 def test_benchmark_smoke_help_runs_from_project_root() -> None:
     result = subprocess.run(
         [sys.executable, "scripts/benchmark_smoke.py", "--help"],
@@ -75,6 +91,29 @@ def test_benchmark_smoke_help_runs_from_project_root() -> None:
     )
     assert result.returncode == 0
     assert "Compare trace-free" in result.stdout
+
+
+def test_latency_suite_help_runs_from_project_root() -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/latency_suite.py", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "Latency suite" in result.stdout
+
+
+def test_latency_suite_dry_run_lists_jobs_without_loading_models() -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/latency_suite.py", "--model", "fake", "--dry-run", "--profile", "quick"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "raw_vllm.generate" in result.stdout
+    assert "wllm.extract.logprobs" in result.stdout
 
 
 def test_serve_command_parses_common_vllm_options() -> None:
@@ -97,6 +136,7 @@ def test_serve_command_parses_common_vllm_options() -> None:
             "--local-files-only",
             "--prewarm-hidden-states",
             "--enable-online-hidden-states",
+            "--enable-attention-weights",
         ]
     )
     assert args.model == "Qwen/Qwen3-0.6B"
@@ -114,6 +154,7 @@ def test_serve_command_parses_common_vllm_options() -> None:
     assert args.local_files_only is True
     assert args.prewarm_hidden_states is True
     assert args.enable_online_hidden_states is True
+    assert args.enable_attention_weights is True
 
 
 def test_serve_command_rejects_missing_model() -> None:
@@ -159,6 +200,89 @@ def test_serve_help_does_not_import_vllm_or_torch() -> None:
     assert "imported_torch=False" in result.stdout
 
 
+def test_doctor_help_does_not_import_vllm_or_torch() -> None:
+    result = _import_probe("vllm", ["doctor", "--help"])
+    assert result.returncode == 0
+    assert "doctor" in result.stdout
+    assert "imported_vllm=False" in result.stdout
+    assert "imported_torch=False" in result.stdout
+
+
+def test_doctor_reports_supported_environment(monkeypatch, capsys) -> None:
+    versions = {
+        "wllm": "0.1.0",
+        "vllm": "0.10.2",
+        "torch": "2.3.0",
+        "transformers": "4.43.0",
+    }
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda name: versions[name])
+
+    rc = cli.main(["doctor"])
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "[ok] vllm: installed supported version 0.10.2" in output
+    assert "[ok] torch: installed version 2.3.0" in output
+
+
+def test_doctor_rejects_unsupported_vllm_version(monkeypatch, capsys) -> None:
+    versions = {
+        "wllm": "0.1.0",
+        "vllm": "0.10.3",
+        "torch": "2.3.0",
+        "transformers": "4.43.0",
+    }
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda name: versions[name])
+
+    rc = cli.main(["doctor"])
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "[error] vllm: unsupported version 0.10.3; expected exactly 0.10.2" in output
+
+
+def test_doctor_json_reports_missing_optional_packages(monkeypatch, capsys) -> None:
+    import json
+
+    def fake_version(name: str) -> str:
+        if name == "wllm":
+            return "0.1.0"
+        if name == "vllm":
+            return "0.10.2"
+        raise cli.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", fake_version)
+
+    rc = cli.main(["doctor", "--json"])
+
+    body = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert body["ok"] is True
+    checks = {check["name"]: check for check in body["checks"]}
+    assert checks["torch"]["status"] == "warning"
+    assert checks["transformers"]["status"] == "warning"
+
+
+def test_doctor_local_files_only_rejects_missing_path(monkeypatch, tmp_path, capsys) -> None:
+    versions = {
+        "wllm": "0.1.0",
+        "vllm": "0.10.2",
+        "torch": "2.3.0",
+        "transformers": "4.43.0",
+    }
+    missing = tmp_path / "missing-model"
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda name: versions[name])
+
+    rc = cli.main(["doctor", "--model", str(missing), "--local-files-only"])
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "[error] model: local path does not exist:" in output
+
+
 # ---------------------------------------------------------------------------
 # VAL-CLI-004 .. VAL-CLI-021: accepted options, defaults and explicit values
 # ---------------------------------------------------------------------------
@@ -182,7 +306,16 @@ def test_accepted_option_defaults() -> None:
     assert args.local_files_only is False  # VAL-CLI-015
     assert args.prewarm_hidden_states is False  # VAL-CLI-017
     assert args.enable_online_hidden_states is False  # VAL-CLI-018
+    assert args.enable_attention_weights is False
     assert args.artifact_dir == "./wllm-artifacts"  # VAL-CLI-019
+    assert args.max_top_k == 50
+    assert args.max_selected_layers == 8
+    assert args.max_selected_heads == 32
+    assert args.max_selected_positions == 256
+    assert args.max_inline_tensor_bytes == 1_000_000
+    assert args.max_total_captured_tensor_bytes == 64_000_000
+    assert args.max_artifact_bytes == 256_000_000
+    assert args.large_extraction_enabled is False
     assert args.log_level == "info"  # VAL-CLI-021
 
 
@@ -206,7 +339,16 @@ def test_accepted_option_explicit_values() -> None:
             "--local-files-only",
             "--prewarm-hidden-states",
             "--enable-online-hidden-states",
+            "--enable-attention-weights",
             "--artifact-dir", "/tmp/artifacts",
+            "--max-top-k", "9",
+            "--max-selected-layers", "3",
+            "--max-selected-heads", "4",
+            "--max-selected-positions", "32",
+            "--max-inline-tensor-bytes", "2000",
+            "--max-total-captured-tensor-bytes", "3000",
+            "--max-artifact-bytes", "4000",
+            "--enable-large-extraction",
             "--log-level", "debug",
         ]
     )
@@ -224,7 +366,16 @@ def test_accepted_option_explicit_values() -> None:
     assert args.local_files_only is True
     assert args.prewarm_hidden_states is True
     assert args.enable_online_hidden_states is True
+    assert args.enable_attention_weights is True
     assert args.artifact_dir == "/tmp/artifacts"
+    assert args.max_top_k == 9
+    assert args.max_selected_layers == 3
+    assert args.max_selected_heads == 4
+    assert args.max_selected_positions == 32
+    assert args.max_inline_tensor_bytes == 2000
+    assert args.max_total_captured_tensor_bytes == 3000
+    assert args.max_artifact_bytes == 4000
+    assert args.large_extraction_enabled is True
     assert args.log_level == "debug"
 
 
@@ -287,7 +438,16 @@ def test_serve_help_lists_every_accepted_option() -> None:
         "--local-files-only",
         "--prewarm-hidden-states",
         "--enable-online-hidden-states",
+        "--enable-attention-weights",
         "--artifact-dir",
+        "--max-top-k",
+        "--max-selected-layers",
+        "--max-selected-heads",
+        "--max-selected-positions",
+        "--max-inline-tensor-bytes",
+        "--max-total-captured-tensor-bytes",
+        "--max-artifact-bytes",
+        "--enable-large-extraction",
         "--log-level",
     ]
     for flag in expected_flags:
@@ -347,8 +507,9 @@ def _run_cmd_serve_with_fakes(args: argparse.Namespace, captured: dict, monkeypa
         def __init__(self, path):
             captured["artifact_dir"] = path
 
-    def fake_create_app(runtime, artifact_store, api_key):
+    def fake_create_app(runtime, artifact_store, limits, api_key):
         captured["api_key"] = api_key
+        captured["limits"] = limits
         captured["runtime"] = runtime
         return object()
 
@@ -385,7 +546,16 @@ def test_cmd_serve_propagates_every_parsed_option(monkeypatch, tmp_path) -> None
             "--local-files-only",
             "--prewarm-hidden-states",
             "--enable-online-hidden-states",
+            "--enable-attention-weights",
             "--artifact-dir", str(tmp_path / "artifacts"),
+            "--max-top-k", "7",
+            "--max-selected-layers", "5",
+            "--max-selected-heads", "6",
+            "--max-selected-positions", "128",
+            "--max-inline-tensor-bytes", "2048",
+            "--max-total-captured-tensor-bytes", "4096",
+            "--max-artifact-bytes", "8192",
+            "--enable-large-extraction",
             "--log-level", "debug",
         ]
     )
@@ -406,18 +576,42 @@ def test_cmd_serve_propagates_every_parsed_option(monkeypatch, tmp_path) -> None
     assert config.local_files_only is True
     assert config.prewarm_hidden_states is True
     assert config.enable_online_hidden_states is True
+    assert config.enable_attention_weights is True
     # Non-config args consumed by their named consumers
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 8100
     assert captured["api_key"] == "sk-abc"
     assert captured["artifact_dir"] == tmp_path / "artifacts"
+    limits = captured["limits"]
+    assert limits.max_top_k == 7
+    assert limits.max_selected_layers == 5
+    assert limits.max_selected_heads == 6
+    assert limits.max_selected_positions == 128
+    assert limits.max_inline_tensor_bytes == 2048
+    assert limits.max_total_captured_tensor_bytes == 4096
+    assert limits.max_artifact_bytes == 8192
+    assert limits.large_extraction_enabled is True
     assert captured["log_level"] == "debug"
     assert captured.get("prewarmed") is True
 
     # Every argparse attribute (except command/func) must be consumed by either
     # the VLLMRuntimeConfig fields or the named non-config consumers.
     config_fields = set(vars(config))
-    consumed_elsewhere = {"host", "port", "api_key", "artifact_dir", "log_level"}
+    consumed_elsewhere = {
+        "host",
+        "port",
+        "api_key",
+        "artifact_dir",
+        "max_top_k",
+        "max_selected_layers",
+        "max_selected_heads",
+        "max_selected_positions",
+        "max_inline_tensor_bytes",
+        "max_total_captured_tensor_bytes",
+        "max_artifact_bytes",
+        "large_extraction_enabled",
+        "log_level",
+    }
     parsed_attrs = set(vars(args)) - {"command", "func"}
     leftover = parsed_attrs - config_fields - consumed_elsewhere
     assert not leftover, f"parsed but dropped before reaching a consumer: {leftover}"
@@ -559,9 +753,9 @@ def test_tensor_parallel_size_rejects_non_positive(bad_tp: str) -> None:
         parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--tensor-parallel-size", bad_tp])
 
 
-@pytest.mark.parametrize("bad_gmu", ["-0.1", "1.1", "2.0", "-1.0"])
+@pytest.mark.parametrize("bad_gmu", ["-0.1", "0", "0.0", "1.1", "2.0", "-1.0"])
 def test_gpu_memory_utilization_rejects_out_of_range(bad_gmu: str) -> None:
-    """--gpu-memory-utilization rejects values outside [0.0, 1.0]."""
+    """--gpu-memory-utilization rejects values outside (0.0, 1.0]."""
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", bad_gmu])
@@ -575,6 +769,25 @@ def test_max_model_len_rejects_non_positive(bad_ml: str) -> None:
         parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--max-model-len", bad_ml])
 
 
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--max-top-k",
+        "--max-selected-layers",
+        "--max-selected-heads",
+        "--max-selected-positions",
+        "--max-inline-tensor-bytes",
+        "--max-total-captured-tensor-bytes",
+        "--max-artifact-bytes",
+    ],
+)
+@pytest.mark.parametrize("bad_value", ["0", "-1"])
+def test_resource_limit_flags_reject_non_positive(flag: str, bad_value: str) -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "Qwen/Qwen3-0.6B", flag, bad_value])
+
+
 def test_port_accepts_boundary_values() -> None:
     """--port accepts 1 and 65535 (boundary values)."""
     parser = cli.build_parser()
@@ -584,10 +797,8 @@ def test_port_accepts_boundary_values() -> None:
     assert args.port == 65535
 
 
-def test_gpu_memory_utilization_accepts_boundary_values() -> None:
-    """--gpu-memory-utilization accepts 0.0 and 1.0 (boundary values)."""
+def test_gpu_memory_utilization_accepts_upper_boundary_value() -> None:
+    """--gpu-memory-utilization accepts 1.0 as the upper boundary."""
     parser = cli.build_parser()
-    args = parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", "0.0"])
-    assert args.gpu_memory_utilization == 0.0
     args = parser.parse_args(["serve", "Qwen/Qwen3-0.6B", "--gpu-memory-utilization", "1.0"])
     assert args.gpu_memory_utilization == 1.0

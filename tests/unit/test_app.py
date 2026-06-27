@@ -282,6 +282,25 @@ def test_api_key_middleware_allows_bearer_prefix_and_bare_token() -> None:
     assert client.get("/v1/models", headers={"Authorization": "Bearer secret"}).status_code == 200
 
 
+def test_api_key_middleware_uses_constant_time_compare(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+    import server.app as app_module
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_compare_digest(left: str, right: str) -> bool:
+        calls.append((left, right))
+        return left == right
+
+    monkeypatch.setattr(app_module.hmac, "compare_digest", fake_compare_digest)
+    runtime = FakeRuntime()
+    app = create_app(runtime=runtime, api_key="secret")
+    client = TestClient(app)
+
+    assert client.get("/v1/models", headers={"Authorization": "Bearer secret"}).status_code == 200
+    assert calls == [("secret", "secret")]
+
+
 def test_app_without_api_key_allows_all_requests() -> None:
     from fastapi.testclient import TestClient
 

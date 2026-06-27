@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from artifacts.store import ArtifactStore
 from extractors.planning import ResourceLimits
 from runtime.base import InferenceRuntime
-from server.errors import WLLMError, request_validation_handler, unexpected_exception_handler, wllm_exception_handler
+from server.errors import (
+    WLLMError,
+    http_exception_handler,
+    request_validation_handler,
+    unexpected_exception_handler,
+    wllm_exception_handler,
+)
 from server.routes import router
 
 
@@ -33,6 +41,7 @@ def create_app(
         app.middleware("http")(_api_key_middleware)
     app.add_exception_handler(WLLMError, cast(Any, wllm_exception_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, request_validation_handler))
+    app.add_exception_handler(StarletteHTTPException, cast(Any, http_exception_handler))
     app.add_exception_handler(Exception, cast(Any, unexpected_exception_handler))
     app.include_router(router)
     return app
@@ -47,13 +56,14 @@ async def _api_key_middleware(request: Request, call_next):
         token = header[7:]
     else:
         token = header
-    if token != expected:
+    if not hmac.compare_digest(token, expected):
         return JSONResponse(
             status_code=401,
             content={
                 "error": {
                     "message": "Unauthorized: invalid or missing API key.",
                     "type": "authentication_error",
+                    "status": 401,
                     "param": None,
                     "code": "invalid_api_key",
                     "details": {},

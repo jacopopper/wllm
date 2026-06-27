@@ -42,6 +42,7 @@ def default_vllm_capabilities(
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     online_hidden_states: bool = False,
+    attention_weights: bool = False,
 ) -> RuntimeCapabilities:
     replay_available = (
         tensor_parallel_size == 1
@@ -107,6 +108,34 @@ def default_vllm_capabilities(
                 "capture_site": "transformer_block_output",
             },
         )
+    if attention_weights:
+        attentions = Capability(
+            state="conditional",
+            reason=(
+                "Attention weights are available only on extraction endpoints "
+                "through an experimental Transformers replay pass after vLLM "
+                "generation completes. Normal chat and completion requests do "
+                "not capture attention weights."
+            ),
+            details={
+                "backend": "transformers_replay",
+                "capture_modes": ["replay"],
+                "capture_site": "attention_weights",
+                "serving_path": "unchanged",
+                "attention_backend": attention_backend,
+                "requires": ["torch", "transformers"],
+            },
+        )
+    else:
+        attentions = Capability(
+            state="unsupported",
+            reason="Attention weights are not exposed by fused attention backends through the public path.",
+            details={
+                **({"attention_backend": attention_backend} if attention_backend is not None else {}),
+                "enable_attention_weights": False,
+            },
+        )
+
     return RuntimeCapabilities(
         model=model,
         vllm_version=vllm_version,
@@ -127,11 +156,7 @@ def default_vllm_capabilities(
             reason="The public vLLM generation output does not expose the complete token distribution.",
         ),
         hidden_states=hidden_states,
-        attentions=Capability(
-            state="unsupported",
-            reason="Attention weights are not exposed by fused attention backends through the public path.",
-            details={"attention_backend": attention_backend} if attention_backend is not None else {},
-        ),
+        attentions=attentions,
         npz_artifacts=Capability(state="supported"),
         pt_artifacts=Capability(state="conditional", reason="Requires torch to be installed and configured."),
     )

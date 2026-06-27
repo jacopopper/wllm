@@ -16,12 +16,15 @@ from runtime.capabilities import RuntimeCapabilities, default_vllm_capabilities
 from runtime.orchestration import ExtractionOrchestrator, GeneratedTraceInputs, LogprobCandidate
 from runtime.vllm_compat import (
     SUPPORTED_VLLM_VERSION,
+    OnlineHiddenStateSelection,
     capture_online_hidden_states,
     capture_pooling_hidden_states,
+    capture_transformers_replay_attentions,
     extract_attention_backend,
     extract_model_topology,
     extract_supported_runner_types,
     import_vllm,
+    load_transformers_attention_replay,
     pooling_runner_environment,
     pooling_runner_kwargs,
     supported_kwargs,
@@ -47,6 +50,7 @@ class VLLMRuntimeConfig:
     local_files_only: bool = False
     prewarm_hidden_states: bool = False
     enable_online_hidden_states: bool = False
+    enable_attention_weights: bool = False
 
 
 class VLLMRuntime:
@@ -60,9 +64,12 @@ class VLLMRuntime:
         self._attention_backend: str | None = None
         self._supported_runner_types: list[str] | None = None
         self._pooling_llm: Any | None = None
+        self._attention_replay: Any | None = None
         self._prewarm_initializing = False
         self._load_lock = threading.RLock()
+        self._generation_lock = threading.RLock()
         self._pooling_lock = threading.RLock()
+        self._attention_replay_lock = threading.RLock()
 
     @property
     def served_model_name(self) -> str:
@@ -108,6 +115,7 @@ class VLLMRuntime:
                     tensor_parallel_size=self.config.tensor_parallel_size,
                     gpu_memory_utilization=self.config.gpu_memory_utilization,
                     online_hidden_states=self.config.enable_online_hidden_states,
+                    attention_weights=self.config.enable_attention_weights,
                 )
             except Exception as exc:
                 details: dict[str, Any] = {"exception": repr(exc), "model": self.config.model}
@@ -141,6 +149,7 @@ class VLLMRuntime:
             tensor_parallel_size=self.config.tensor_parallel_size,
             gpu_memory_utilization=self.config.gpu_memory_utilization,
             online_hidden_states=self.config.enable_online_hidden_states,
+            attention_weights=self.config.enable_attention_weights,
         )
 
     def topology(self) -> RuntimeTopology | None:
@@ -221,37 +230,47 @@ class VLLMRuntime:
             sampling = self._sampling_params(request, force_logprobs=request.extract.logprobs is not None)
             capture_mode = self._hidden_state_capture_mode(request)
             online_capture = None
+            online_plan: dict[str, ExtractionPlan | None] | None = None
             if capture_mode == "replay":
                 self._ensure_replay_hidden_state_runtime_available(topology)
             started = time.perf_counter()
-            if capture_mode == "online":
-                requested_layers = self._resolve_hidden_state_layers(request, topology)
-                self._ensure_online_hidden_state_runtime_available(topology)
-                assert topology is not None
-                prompt_token_count = self._tokenized_prompt_length(prompt)
-                self._check_hidden_capture_size_for_shape(
-                    request,
-                    layer_count=len(requested_layers),
-                    token_count=self._online_hidden_capture_token_count_upper_bound(
-                        prompt,
+            with self._generation_lock:
+                if capture_mode == "online":
+                    requested_layers = self._resolve_hidden_state_layers(request, topology)
+                    self._ensure_online_hidden_state_runtime_available(topology)
+                    assert topology is not None
+                    prompt_token_count = self._tokenized_prompt_length(prompt)
+                    self._check_hidden_capture_size_for_shape(
                         request,
-                        prompt_token_count=prompt_token_count,
-                    ),
-                    topology=topology,
-                    limits=limits,
-                )
-                online_capture = capture_online_hidden_states(
-                    llm,
-                    layers=requested_layers,
-                    generate=lambda: llm.generate([prompt], sampling),
-                    capture_max_position=self._online_hidden_capture_max_prefix_position(
-                        request,
-                        prompt_token_count=prompt_token_count,
-                    ),
-                )
-                outputs = online_capture.output
-            else:
-                outputs = llm.generate([prompt], sampling)
+                        layer_count=len(requested_layers),
+                        token_count=self._online_hidden_capture_token_count_upper_bound(
+                            prompt,
+                            request,
+                            prompt_token_count=prompt_token_count,
+                        ),
+                        topology=topology,
+                        limits=limits,
+                    )
+                    online_plan = {"plan": None}
+                    online_capture = capture_online_hidden_states(
+                        llm,
+                        layers=requested_layers,
+                        generate=lambda: self._generate_with_tqdm_disabled(llm, [prompt], sampling),
+                        capture_max_position=self._online_hidden_capture_max_prefix_position(
+                            request,
+                            prompt_token_count=prompt_token_count,
+                        ),
+                        select_hidden_states=lambda outputs: self._online_hidden_state_selections_for_outputs(
+                            request,
+                            outputs,
+                            limits=limits,
+                            topology=topology,
+                            plan_holder=online_plan,
+                        ),
+                    )
+                    outputs = online_capture.output
+                else:
+                    outputs = self._generate_with_tqdm_disabled(llm, [prompt], sampling)
             generation_ms = (time.perf_counter() - started) * 1000.0
             output = outputs[0]
             completion = output.outputs[0]
@@ -259,14 +278,21 @@ class VLLMRuntime:
             prompt_ids = list(getattr(output, "prompt_token_ids", []) or [])
             generated_ids = list(getattr(completion, "token_ids", []) or [])
             token_ids = prompt_ids + generated_ids
-            plan = self._compile_post_generation_plan(request, prompt_ids, generated_ids, limits, topology)
+            plan = (
+                online_plan["plan"]
+                if online_plan is not None and online_plan["plan"] is not None
+                else self._compile_post_generation_plan(request, prompt_ids, generated_ids, limits, topology)
+            )
             hidden_capture_mode = capture_mode or "replay"
             hidden_capture_phase = "replay"
             hidden_capture_metadata: dict[str, Any] = {}
+            preselected_hidden_states: dict[str, Any] = {}
+            attention_capture_metadata: dict[str, Any] = {}
             if capture_mode == "online":
                 if online_capture is None:
                     raise AssertionError("online capture mode did not produce a capture result")
                 hidden_states = online_capture.tensors
+                preselected_hidden_states = online_capture.selected_tensors
                 hidden_capture_site = online_capture.capture_site
                 hidden_capture_phase = online_capture.capture_phase
                 hidden_capture_metadata = online_capture.metadata
@@ -288,6 +314,16 @@ class VLLMRuntime:
                     limits,
                 )
                 capture_ms = (time.perf_counter() - capture_started) * 1000.0 if request.extract.hidden_states else 0.0
+            attention_started = time.perf_counter()
+            attentions, attention_capture_metadata = self._extract_attention_weights_if_requested(
+                request,
+                token_ids,
+                plan,
+                topology,
+                limits,
+            )
+            if request.extract.attentions:
+                capture_ms += (time.perf_counter() - attention_started) * 1000.0
             inputs = GeneratedTraceInputs(
                 model=self.served_model_name,
                 generation=generation,
@@ -297,10 +333,13 @@ class VLLMRuntime:
                 prompt_logprobs=self._logprob_candidates_from_entries(getattr(output, "prompt_logprobs", None)),
                 generated_logprobs=self._logprob_candidates(completion),
                 hidden_states=hidden_states,
+                preselected_hidden_states=preselected_hidden_states,
                 hidden_state_capture_site=hidden_capture_site,
                 hidden_state_capture_mode=hidden_capture_mode,
                 hidden_state_capture_phase=hidden_capture_phase,
                 hidden_state_capture_metadata=hidden_capture_metadata,
+                attentions=attentions,
+                attention_capture_metadata=attention_capture_metadata,
                 generation_ms=generation_ms,
                 capture_ms=capture_ms,
                 topology=topology,
@@ -332,6 +371,56 @@ class VLLMRuntime:
             generated_token_count=len(generated_ids),
             limits=limits,
         )
+
+    def _online_hidden_state_selections_for_outputs(
+        self,
+        request: ExtractRequest,
+        outputs: list[Any],
+        *,
+        limits: ResourceLimits,
+        topology: RuntimeTopology,
+        plan_holder: dict[str, ExtractionPlan | None],
+    ) -> list[OnlineHiddenStateSelection]:
+        if not outputs:
+            plan_holder["plan"] = None
+            return []
+        output = outputs[0]
+        completions = list(getattr(output, "outputs", []) or [])
+        if not completions:
+            plan_holder["plan"] = None
+            return []
+        prompt_ids = list(getattr(output, "prompt_token_ids", []) or [])
+        generated_ids = list(getattr(completions[0], "token_ids", []) or [])
+        plan = self._compile_post_generation_plan(request, prompt_ids, generated_ids, limits, topology)
+        plan_holder["plan"] = plan
+        if plan is None:
+            return []
+        prompt_token_count = len(prompt_ids)
+        return [
+            OnlineHiddenStateSelection(
+                name=f"hidden_states_{index}",
+                layers=selection["layers"],
+                positions=_source_positions_for_online_capture(
+                    selection["positions"],
+                    prompt_token_count=prompt_token_count,
+                ),
+                pool=selection["pool"],
+            )
+            for index, selection in enumerate(plan.hidden_states)
+        ]
+
+    def _generate_with_tqdm_disabled(self, llm: Any, prompts: list[str], sampling: Any) -> Any:
+        with self._generation_lock:
+            try:
+                parameter_names = supported_parameter_names(llm.generate)
+            except (TypeError, ValueError):
+                parameter_names = None
+            if parameter_names is None or "use_tqdm" in parameter_names:
+                try:
+                    return llm.generate(prompts, sampling, use_tqdm=False)
+                except TypeError:
+                    return llm.generate(prompts, sampling)
+            return llm.generate(prompts, sampling)
 
     def _hidden_state_capture_mode(self, request: ExtractRequest) -> str | None:
         if not request.extract.hidden_states:
@@ -475,6 +564,134 @@ class VLLMRuntime:
                     "dtype": self.config.dtype,
                 },
             )
+
+    def _extract_attention_weights_if_requested(
+        self,
+        request: ExtractRequest,
+        token_ids: list[int],
+        plan: ExtractionPlan | None,
+        topology: RuntimeTopology | None,
+        limits: ResourceLimits,
+    ) -> tuple[dict[int, Any], dict[str, Any]]:
+        if not request.extract.attentions:
+            return {}, {}
+        self._ensure_attention_replay_runtime_available(topology)
+        if topology is None or plan is None or topology.num_attention_heads is None:
+            raise UnsupportedExtractionError(
+                "Attention extraction requires runtime topology so selectors can be resolved.",
+                code="attention_topology_unavailable",
+                param="extract.attentions",
+            )
+        self._check_attention_capture_size(request, token_ids, plan, topology, limits)
+        requested_layers = sorted({layer for selection in plan.attentions for layer in selection["layers"]})
+        with self._attention_replay_lock:
+            replay = self._ensure_attention_replay()
+            captured = capture_transformers_replay_attentions(replay, token_ids=token_ids)
+        missing_layers = [layer for layer in requested_layers if layer not in captured]
+        if missing_layers:
+            raise UnsupportedExtractionError(
+                "The Transformers replay path did not return every requested attention layer.",
+                code="attention_layer_unavailable",
+                param="extract.attentions",
+                details={"missing_layers": missing_layers, "captured_layers": sorted(captured)},
+            )
+        metadata = {
+            "backend": "transformers_replay",
+            "requested_layers": requested_layers,
+            "replayed_token_count": len(token_ids),
+            "model": self.config.model,
+            "tokenizer": self.config.tokenizer or self.config.model,
+            "use_cache": False,
+            "output_attentions": True,
+            "replay_device": getattr(replay, "device", None),
+        }
+        return {layer: captured[layer] for layer in requested_layers}, metadata
+
+    def _ensure_attention_replay_runtime_available(self, topology: RuntimeTopology | None) -> None:
+        if not self.config.enable_attention_weights:
+            from extractors.attentions import attentions_unavailable
+
+            attentions_unavailable(details={"capability": self.capabilities().attentions.model_dump(mode="json")})
+        if topology is None or topology.num_attention_heads is None:
+            raise UnsupportedExtractionError(
+                "Attention extraction requires runtime topology with num_attention_heads.",
+                code="attention_topology_unavailable",
+                param="extract.attentions",
+            )
+
+    def _check_attention_capture_size(
+        self,
+        request: ExtractRequest,
+        token_ids: list[int],
+        plan: ExtractionPlan,
+        topology: RuntimeTopology,
+        limits: ResourceLimits,
+    ) -> None:
+        if not request.extract.attentions:
+            return
+        if topology.num_attention_heads is None:
+            raise UnsupportedExtractionError(
+                "Attention extraction requires runtime num_attention_heads so resource limits can be enforced.",
+                code="attention_topology_unavailable",
+                param="extract.attentions",
+            )
+        dtype_bytes = _dtype_byte_size(self.config.dtype)
+        replay_bytes = _estimate_attention_capture_bytes(
+            layer_count=topology.num_layers,
+            head_count=topology.num_attention_heads,
+            token_count=len(token_ids),
+            dtype_bytes=dtype_bytes,
+        )
+        if replay_bytes > limits.max_total_captured_tensor_bytes:
+            raise ResourceLimitError(
+                "Requested attention replay exceeds the total captured tensor byte limit before selection.",
+                param="extract.attentions",
+                details={
+                    "estimated_raw_capture_bytes": replay_bytes,
+                    "limit": limits.max_total_captured_tensor_bytes,
+                    "captured_layers": topology.num_layers,
+                    "captured_heads_per_layer": topology.num_attention_heads,
+                    "captured_tokens": len(token_ids),
+                    "dtype": self.config.dtype,
+                },
+            )
+        selected_bytes = 0
+        for selection in plan.attentions:
+            head_count = (
+                topology.num_attention_heads
+                if selection["heads"] == "all"
+                else len(selection["heads"])
+            )
+            max_key_count = max(
+                (len(selection["key_positions"].get(query, [])) for query in selection["query_positions"]),
+                default=0,
+            )
+            selected_bytes += _estimate_attention_capture_bytes(
+                layer_count=len(selection["layers"]),
+                head_count=head_count,
+                token_count=1,
+                dtype_bytes=dtype_bytes,
+                query_count=len(selection["query_positions"]),
+                key_count=max_key_count,
+            )
+        if selected_bytes > limits.max_total_captured_tensor_bytes:
+            raise ResourceLimitError(
+                "Requested selected attention tensors exceed the total captured tensor byte limit.",
+                param="extract.attentions",
+                details={"estimated_selected_bytes": selected_bytes, "limit": limits.max_total_captured_tensor_bytes},
+            )
+
+    def _ensure_attention_replay(self) -> Any:
+        if self._attention_replay is not None:
+            return self._attention_replay
+        self._attention_replay = load_transformers_attention_replay(
+            model=self.config.model,
+            tokenizer=self.config.tokenizer,
+            dtype=self.config.dtype,
+            trust_remote_code=self.config.trust_remote_code,
+            local_files_only=self.config.local_files_only,
+        )
+        return self._attention_replay
 
     def _online_hidden_capture_token_count_upper_bound(
         self,
@@ -728,7 +945,7 @@ class VLLMRuntime:
     def _generate_openai_response(self, request: Any, prompts: list[str], *, chat: bool) -> dict[str, Any]:
         sampling = self._sampling_params(request)
         created = int(time.time())
-        outputs = self._require_llm().generate(prompts, sampling)
+        outputs = self._generate_with_tqdm_disabled(self._require_llm(), prompts, sampling)
         choices = []
         prompt_tokens = 0
         completion_tokens = 0
@@ -891,6 +1108,10 @@ class _temporary_environment:
                 os.environ[key] = value
 
 
+def _source_positions_for_online_capture(positions: list[int], *, prompt_token_count: int) -> list[int]:
+    return [position if position < prompt_token_count else position - 1 for position in positions]
+
+
 def _estimate_hidden_capture_bytes(
     *,
     layer_count: int,
@@ -899,6 +1120,20 @@ def _estimate_hidden_capture_bytes(
     dtype: str,
 ) -> int:
     return layer_count * token_count * int(topology.hidden_size or 0) * _dtype_byte_size(dtype)
+
+
+def _estimate_attention_capture_bytes(
+    *,
+    layer_count: int,
+    head_count: int,
+    token_count: int,
+    dtype_bytes: int,
+    query_count: int | None = None,
+    key_count: int | None = None,
+) -> int:
+    queries = token_count if query_count is None else query_count
+    keys = token_count if key_count is None else key_count
+    return layer_count * head_count * queries * keys * dtype_bytes
 
 
 def _dtype_byte_size(dtype: str) -> int:

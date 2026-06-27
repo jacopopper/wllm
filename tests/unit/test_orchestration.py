@@ -56,6 +56,20 @@ def capabilities_with_hidden_states():
     )
 
 
+def capabilities_with_attentions():
+    return default_vllm_capabilities("fake", "fake", attention_weights=True)
+
+
+def make_attention_inputs() -> GeneratedTraceInputs:
+    layer_0 = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
+    layer_1 = layer_0 + 1000.0
+    return replace(
+        make_inputs(),
+        attentions={0: layer_0, 1: layer_1},
+        attention_capture_metadata={"backend": "fake_replay"},
+    )
+
+
 def test_orchestrator_builds_trace_and_npz_artifact(tmp_path) -> None:
     request = ExtractRequest.model_validate(
         {
@@ -521,6 +535,162 @@ def test_hidden_state_records_can_be_artifact_backed(tmp_path) -> None:
     tensors = load_artifact(tmp_path, trace.artifacts[0])
     assert np.array_equal(tensors["hidden_states_0"][0, :, :3], np.asarray(
         [[64, 65, 66], [96, 97, 98]], dtype=np.float32))
+
+
+def test_attention_records_are_returned_inline_when_supported(tmp_path) -> None:
+    request = ExtractRequest.model_validate(
+        {
+            "model": "fake",
+            "prompt": "hello",
+            "extract": {
+                "attentions": [
+                    {
+                        "layers": [0, 1],
+                        "heads": [0],
+                        "query_positions": "generated",
+                        "key_positions": "previous_token",
+                    }
+                ]
+            },
+        }
+    )
+    orchestrator = ExtractionOrchestrator(capabilities_with_attentions())
+
+    trace = orchestrator.build_trace(
+        request,
+        make_attention_inputs(),
+        limits=ResourceLimits(),
+        artifact_store=ArtifactStore(tmp_path),
+        persist=False,
+    )
+
+    record = trace.trace.attentions[0]
+    assert record.name == "attentions_0"
+    assert record.shape == [2, 1, 2, 1]
+    assert record.layers == [0, 1]
+    assert record.heads == [0]
+    assert record.positions == [2, 3]
+    assert record.capture_site == "attention_weights"
+    assert record.capture_mode == "replay"
+    assert record.capture_phase == "replay"
+    assert record.position_semantics["selected_key_positions_by_query"] == [
+        {"query_position": 2, "key_positions": [1]},
+        {"query_position": 3, "key_positions": [2]},
+    ]
+    assert record.capture_metadata["backend"] == "fake_replay"
+    assert record.byte_size == 2 * 1 * 2 * 1 * 4
+    assert record.data[0][0][0][0] == 9.0
+    assert record.data[0][0][1][0] == 14.0
+    assert record.data[1][0][0][0] == 1009.0
+    assert trace.metadata.capture["attentions"]["capture_modes"] == ["replay"]
+
+
+def test_previous_token_attention_keeps_query_with_no_previous_key(tmp_path) -> None:
+    request = ExtractRequest.model_validate(
+        {
+            "model": "fake",
+            "prompt": "hello",
+            "extract": {
+                "attentions": [
+                    {
+                        "layers": 0,
+                        "heads": 0,
+                        "query_positions": "prompt",
+                        "key_positions": "previous_token",
+                    }
+                ]
+            },
+        }
+    )
+    orchestrator = ExtractionOrchestrator(capabilities_with_attentions())
+
+    trace = orchestrator.build_trace(
+        request,
+        make_attention_inputs(),
+        limits=ResourceLimits(),
+        artifact_store=ArtifactStore(tmp_path),
+        persist=False,
+    )
+
+    record = trace.trace.attentions[0]
+    assert record.shape == [1, 1, 2, 1]
+    assert np.isnan(record.data[0][0][0][0])
+    assert record.data[0][0][1][0] == 4.0
+    assert record.position_semantics["selected_key_positions_by_query"] == [
+        {"query_position": 0, "key_positions": []},
+        {"query_position": 1, "key_positions": [0]},
+    ]
+
+
+def test_attention_records_can_be_artifact_backed(tmp_path) -> None:
+    request = ExtractRequest.model_validate(
+        {
+            "model": "fake",
+            "prompt": "hello",
+            "extract": {
+                "attentions": [
+                    {
+                        "layers": 0,
+                        "heads": "all",
+                        "query_positions": "last_generated",
+                        "key_positions": "prompt",
+                    }
+                ],
+                "artifacts": {"format": "npz", "include": ["attentions"]},
+            },
+        }
+    )
+    orchestrator = ExtractionOrchestrator(capabilities_with_attentions())
+
+    trace = orchestrator.build_trace(
+        request,
+        make_attention_inputs(),
+        limits=ResourceLimits(),
+        artifact_store=ArtifactStore(tmp_path),
+        persist=False,
+    )
+
+    assert len(trace.artifacts) == 1
+    record = trace.trace.attentions[0]
+    assert record.data is None
+    assert record.artifact_id == trace.artifacts[0].artifact_id
+    assert record.heads == [0, 1]
+    assert trace.artifacts[0].tensor_shapes["attentions_0"] == [1, 2, 1, 2]
+    tensors = load_artifact(tmp_path, trace.artifacts[0])
+    assert np.array_equal(tensors["attentions_0"][0, 0, 0], np.asarray([12, 13], dtype=np.float32))
+    assert np.array_equal(tensors["attentions_0"][0, 1, 0], np.asarray([28, 29], dtype=np.float32))
+
+
+def test_inline_attention_records_respect_inline_byte_limit(tmp_path) -> None:
+    request = ExtractRequest.model_validate(
+        {
+            "model": "fake",
+            "prompt": "hello",
+            "extract": {
+                "attentions": [
+                    {
+                        "layers": [0, 1],
+                        "heads": [0],
+                        "query_positions": "generated",
+                        "key_positions": "previous_token",
+                    }
+                ]
+            },
+        }
+    )
+    orchestrator = ExtractionOrchestrator(capabilities_with_attentions())
+
+    with pytest.raises(ResourceLimitError) as exc:
+        orchestrator.build_trace(
+            request,
+            make_attention_inputs(),
+            limits=ResourceLimits(max_inline_tensor_bytes=15, max_total_captured_tensor_bytes=1024),
+            artifact_store=ArtifactStore(tmp_path),
+            persist=False,
+        )
+
+    assert exc.value.param == "extract"
+    assert exc.value.details["requested_inline_bytes"] == 16
 
 
 def test_hidden_state_request_fails_when_runtime_did_not_capture_layer(tmp_path) -> None:

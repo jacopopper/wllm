@@ -598,6 +598,17 @@ def test_capability_metadata_online_hidden_states_enables_online_mode() -> None:
     assert "online" in capture_modes
 
 
+def test_capability_metadata_attention_weights_requires_opt_in() -> None:
+    disabled = default_vllm_capabilities("fake-model", "0.10.2")
+    enabled = default_vllm_capabilities("fake-model", "0.10.2", attention_weights=True)
+
+    assert disabled.attentions.state == "unsupported"
+    assert disabled.attentions.details["enable_attention_weights"] is False
+    assert enabled.attentions.state == "conditional"
+    assert enabled.attentions.details["backend"] == "transformers_replay"
+    assert enabled.attentions.details["capture_modes"] == ["replay"]
+
+
 # ---------------------------------------------------------------------------
 # VAL-CROSS-021: research adapters not imported during normal serving
 # ---------------------------------------------------------------------------
@@ -850,7 +861,8 @@ def test_log_level_affects_logging_basic_config(monkeypatch) -> None:
         def __init__(self, path):
             pass
 
-    def fake_create_app(runtime, artifact_store, api_key):
+    def fake_create_app(runtime, artifact_store, limits, api_key):
+        del runtime, artifact_store, limits, api_key
         return object()
 
     def fake_uvicorn_run(app, host, port, log_level):
@@ -905,8 +917,10 @@ def test_serve_lifecycle_start_serve_shutdown_flow(monkeypatch, tmp_path) -> Non
         def __init__(self, path):
             captured["artifact_dir"] = path
 
-    def fake_create_app(runtime, artifact_store, api_key):
+    def fake_create_app(runtime, artifact_store, limits, api_key):
+        del runtime, artifact_store
         captured["create_app_called"] = True
+        captured["limits"] = limits
         captured["api_key"] = api_key
         return object()
 
@@ -966,7 +980,8 @@ def test_serve_lifecycle_with_prewarm_config(monkeypatch, tmp_path) -> None:
         def __init__(self, path):
             captured["artifact_dir"] = path
 
-    def fake_create_app(runtime, artifact_store, api_key):
+    def fake_create_app(runtime, artifact_store, limits, api_key):
+        del runtime, artifact_store, limits, api_key
         captured["create_app_called"] = True
         return object()
 
@@ -1015,7 +1030,8 @@ def test_serve_lifecycle_with_api_key(monkeypatch, tmp_path) -> None:
         def __init__(self, path):
             captured["artifact_dir"] = path
 
-    def fake_create_app(runtime, artifact_store, api_key):
+    def fake_create_app(runtime, artifact_store, limits, api_key):
+        del runtime, artifact_store, limits
         captured["create_app_called"] = True
         captured["api_key"] = api_key
         return object()
@@ -1059,6 +1075,14 @@ def test_serve_lifecycle_all_cli_args_flow_through(monkeypatch, tmp_path) -> Non
         "--trust-remote-code",
         "--local-files-only",
         "--artifact-dir", str(tmp_path / "my-artifacts"),
+        "--max-top-k", "11",
+        "--max-selected-layers", "12",
+        "--max-selected-heads", "13",
+        "--max-selected-positions", "14",
+        "--max-inline-tensor-bytes", "15000",
+        "--max-total-captured-tensor-bytes", "16000",
+        "--max-artifact-bytes", "17000",
+        "--enable-large-extraction",
         "--log-level", "warning",
     ])
 
@@ -1076,8 +1100,10 @@ def test_serve_lifecycle_all_cli_args_flow_through(monkeypatch, tmp_path) -> Non
         def __init__(self, path):
             captured["store_path"] = path
 
-    def fake_create_app(runtime, artifact_store, api_key):
+    def fake_create_app(runtime, artifact_store, limits, api_key):
+        del runtime, artifact_store
         captured["api_key_passed"] = api_key
+        captured["limits"] = limits
         return object()
 
     def fake_uvicorn_run(app, host, port, log_level):
@@ -1105,6 +1131,15 @@ def test_serve_lifecycle_all_cli_args_flow_through(monkeypatch, tmp_path) -> Non
     assert config.seed == 42
     assert config.trust_remote_code is True
     assert config.local_files_only is True
+    limits = captured["limits"]
+    assert limits.max_top_k == 11
+    assert limits.max_selected_layers == 12
+    assert limits.max_selected_heads == 13
+    assert limits.max_selected_positions == 14
+    assert limits.max_inline_tensor_bytes == 15000
+    assert limits.max_total_captured_tensor_bytes == 16000
+    assert limits.max_artifact_bytes == 17000
+    assert limits.large_extraction_enabled is True
     assert captured["store_path"] == Path(tmp_path / "my-artifacts")
     assert captured["api_key_passed"] == "sk-test"
     assert captured["uvicorn_host"] == "0.0.0.0"

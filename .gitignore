@@ -1,15 +1,26 @@
 # Runtime artifacts
 wllm-artifacts/
 wllm-stress-artifacts/
+wllm-latency-artifacts/
 
 # Local benchmark harness and generated reports
 scripts/stress_wllm_vs_vllm.py
 scripts/compare_online_vs_replay_hidden_states.py
+reports/wllm_latency_*.json
+reports/wllm_latency_*.md
+reports/wllm_latency_artifacts/
+reports/wllm_attention_*.json
+reports/wllm_attention_*.md
 reports/*stress*.json
 reports/*stress*.md
 reports/wllm_online_vs_replay_*.json
 reports/wllm_online_vs_replay_*.md
 reports/wllm_online_vs_replay_artifacts/
+
+# Markdown planning/release notes stay local; the root README is the only
+# Markdown document included in the release source.
+*.md
+!/README.md
 
 # Build outputs
 dist/

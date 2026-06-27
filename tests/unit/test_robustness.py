@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -80,6 +81,24 @@ class CountingLLM:
         del prompts, sampling
         self.generate_calls += 1
         return [FakeOutput()]
+
+
+class NonReentrantLLM(CountingLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self._active = threading.Lock()
+        self.overlaps = 0
+
+    def generate(self, prompts: list[str], sampling: FakeSamplingParams) -> list[FakeOutput]:
+        acquired = self._active.acquire(blocking=False)
+        if not acquired:
+            self.overlaps += 1
+            raise RuntimeError("concurrent generate")
+        try:
+            time.sleep(0.02)
+            return super().generate(prompts, sampling)
+        finally:
+            self._active.release()
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +189,7 @@ def test_concurrent_extract_requests_have_distinct_trace_ids(tmp_path, monkeypat
     """Two concurrent generate_extract calls produce distinct trace IDs."""
     from extractors.planning import ResourceLimits
 
-    llm = CountingLLM()
+    llm = NonReentrantLLM()
 
     class FakeLLMWrapper:
         def __init__(self, **kwargs: Any) -> None:
@@ -212,6 +231,8 @@ def test_concurrent_extract_requests_have_distinct_trace_ids(tmp_path, monkeypat
         t.join()
 
     assert errors == []
+    assert llm.overlaps == 0
+    assert llm.generate_calls == 3
     assert len(trace_ids) == 3
     assert len(set(trace_ids)) == 3, f"Trace IDs should be unique: {trace_ids}"
     assert runtime._collector_registry is not None
@@ -227,7 +248,7 @@ def test_normal_chat_concurrent_with_extract_does_not_contaminate(tmp_path, monk
     """Normal chat response must not contain extraction fields even when extract runs concurrently."""
     from schemas.openai import ChatCompletionRequest
 
-    llm = CountingLLM()
+    llm = NonReentrantLLM()
 
     class FakeLLMWrapper:
         def __init__(self, **kwargs: Any) -> None:
@@ -247,25 +268,32 @@ def test_normal_chat_concurrent_with_extract_does_not_contaminate(tmp_path, monk
 
     chat_results: list[dict[str, Any]] = []
     extract_results: list[Any] = []
+    errors: list[Exception] = []
 
     def do_chat() -> None:
-        response = runtime.generate_chat(
-            ChatCompletionRequest.model_validate(
-                {"model": "fake", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1}
+        try:
+            response = runtime.generate_chat(
+                ChatCompletionRequest.model_validate(
+                    {"model": "fake", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1}
+                )
             )
-        )
-        chat_results.append(response)
+            chat_results.append(response)
+        except Exception as exc:
+            errors.append(exc)
 
     def do_extract() -> None:
-        trace = runtime.generate_extract(
-            ExtractRequest.model_validate(
-                {"model": "fake", "prompt": "hello", "extract": {"tokens": True}}
-            ),
-            limits=ResourceLimits(),
-            artifact_store=ArtifactStore(tmp_path / "artifacts"),
-            persist=False,
-        )
-        extract_results.append(trace)
+        try:
+            trace = runtime.generate_extract(
+                ExtractRequest.model_validate(
+                    {"model": "fake", "prompt": "hello", "extract": {"tokens": True}}
+                ),
+                limits=ResourceLimits(),
+                artifact_store=ArtifactStore(tmp_path / "artifacts"),
+                persist=False,
+            )
+            extract_results.append(trace)
+        except Exception as exc:
+            errors.append(exc)
 
     threads = [
         threading.Thread(target=do_chat),
@@ -276,6 +304,9 @@ def test_normal_chat_concurrent_with_extract_does_not_contaminate(tmp_path, monk
     for t in threads:
         t.join()
 
+    assert errors == []
+    assert llm.overlaps == 0
+    assert llm.generate_calls == 2
     assert len(chat_results) == 1
     assert len(extract_results) == 1
 

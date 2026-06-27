@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 class WLLMError(Exception):
@@ -116,6 +117,7 @@ def error_envelope(exc: WLLMError) -> dict[str, Any]:
         "error": {
             "message": exc.message,
             "type": exc.error_type,
+            "status": exc.status_code,
             "param": exc.param,
             "code": exc.code,
             "details": exc.details,
@@ -138,6 +140,38 @@ async def request_validation_handler(_request: Request, exc: RequestValidationEr
         details={"errors": details},
     )
     return JSONResponse(status_code=api_error.status_code, content=error_envelope(api_error))
+
+
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if exc.status_code == 404:
+        api_error = WLLMError(
+            "Endpoint not found.",
+            status_code=404,
+            error_type="invalid_request_error",
+            code="endpoint_not_found",
+            details={"path": request.url.path, "method": request.method, "detail": _json_safe(exc.detail)},
+        )
+    elif exc.status_code == 405:
+        api_error = WLLMError(
+            "HTTP method not allowed for this endpoint.",
+            status_code=405,
+            error_type="invalid_request_error",
+            code="method_not_allowed",
+            details={"path": request.url.path, "method": request.method, "detail": _json_safe(exc.detail)},
+        )
+    else:
+        api_error = WLLMError(
+            str(exc.detail) if exc.detail else "HTTP request failed.",
+            status_code=exc.status_code,
+            error_type="invalid_request_error",
+            code="http_error",
+            details={"path": request.url.path, "method": request.method, "detail": _json_safe(exc.detail)},
+        )
+    return JSONResponse(
+        status_code=api_error.status_code,
+        content=error_envelope(api_error),
+        headers=getattr(exc, "headers", None),
+    )
 
 
 async def unexpected_exception_handler(_request: Request, _exc: Exception) -> JSONResponse:
