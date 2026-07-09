@@ -508,6 +508,15 @@ Research adapters live under `src/research/`. They consume `TraceEnvelope`
 objects and artifact tensors; they do not add server routes or paper-specific
 request fields.
 
+Generic helpers for common patterns (chosen token logprobs, last-token hidden
+vectors, etc.) are available in `research.features` (e.g. `chosen_logprobs(trace)`,
+`last_token_hidden(trace, layer=...)`).
+
+A study of the top white-box UQ / hallucination detection methods (token-prob
+baselines, EigenScore/INSIDE, RAUQ attention patterns, SAPLMA-style probes,
+Semantic Entropy) and the general improvements they suggest lives in
+`benchmarking/`. The recommendations are deliberately method-agnostic.
+
 ## Resource Limits
 
 Default server-side limits:

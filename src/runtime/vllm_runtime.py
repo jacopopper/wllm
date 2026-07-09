@@ -227,7 +227,12 @@ class VLLMRuntime:
             topology = self.topology()
             orchestrator.preflight(request, limits, topology=topology)
             prompt = self._render_extract_prompt(request)
-            sampling = self._sampling_params(request, force_logprobs=request.extract.logprobs is not None)
+            # For extraction we always want the chosen token's logprob available
+            # (makes common white-box UQ baselines trivial). Full top-k only if requested.
+            force_logprobs = True  # at minimum for chosen token prob
+            if request.extract.logprobs is not None:
+                force_logprobs = True
+            sampling = self._sampling_params(request, force_logprobs=force_logprobs)
             capture_mode = self._hidden_state_capture_mode(request)
             online_capture = None
             online_plan: dict[str, ExtractionPlan | None] | None = None

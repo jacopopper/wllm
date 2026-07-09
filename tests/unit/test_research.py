@@ -420,3 +420,70 @@ def test_dataset_workflow_build_result_uses_generated_span() -> None:
     assert result["trace_id"] == "trace_1"
     assert result["generated_token_count"] == 2
     assert result["artifact_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Generic feature helpers (chosen_logprobs, hidden_states_matrix)
+# ---------------------------------------------------------------------------
+
+
+def test_chosen_logprobs_from_trace() -> None:
+    from research.features import chosen_logprobs
+
+    # Build a minimal trace with logprobs structure
+    trace = make_trace()
+    # Manually attach logprobs in the shape produced by orchestration
+    trace.trace.logprobs = {
+        "generated": [
+            {"token_id": 12, "token": "c", "logprob": -0.2, "top_logprobs": []},
+            {"token_id": 13, "token": "d", "logprob": -0.1, "top_logprobs": []},
+        ],
+        "prompt": [
+            {"token_id": 10, "token": "a", "logprob": -0.5, "top_logprobs": []},
+        ],
+    }
+
+    res = chosen_logprobs(trace)
+    assert "generated" in res
+    assert res["generated"] == [-0.2, -0.1]
+
+    res_p = chosen_logprobs(trace, include_prompt=True)
+    assert "prompt" in res_p
+    assert res_p["prompt"] == [-0.5]
+
+
+def test_hidden_states_matrix_best_effort() -> None:
+    from research.features import hidden_states_matrix
+
+    trace = make_trace()
+    # Attach a simple hidden record (inline data case)
+    class Rec:
+        layers = [5]
+        positions = "generated"
+        data = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]  # 2 pos x 3 dim
+
+    trace.trace.hidden_states = [Rec()]
+
+    mats = hidden_states_matrix(trace, layer=5)
+    assert "generated" in mats or mats  # best effort may key it
+    # At minimum it should not crash and return something array-like if data present
+    if mats:
+        for v in mats.values():
+            assert hasattr(v, "shape")
+
+
+def test_last_token_hidden_helper() -> None:
+    from research.features import last_token_hidden
+    import numpy as np
+
+    trace = make_trace()
+    class Rec:
+        layers = [5]
+        positions = "last_generated"
+        data = np.array([[0.1, 0.2], [0.3, 0.4]])  # last row is the one
+
+    trace.trace.hidden_states = [Rec()]
+    vec = last_token_hidden(trace, layer=5)
+    assert vec is not None
+    assert vec.shape == (2,)
+    assert abs(float(vec[0]) - 0.3) < 1e-5

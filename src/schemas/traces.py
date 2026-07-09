@@ -32,6 +32,10 @@ class TensorRecord(BaseModel):
 class TokenTrace(BaseModel):
     token_ids: list[int] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)
+    # Chosen (selected) token log probabilities when available from extraction.
+    # Populated for extract paths to make common UQ baselines (min prob, seq prob, etc.)
+    # trivial without requiring full top-k logprobs spec.
+    chosen_logprobs: list[float | None] = Field(default_factory=list)
 
 
 class TraceData(BaseModel):

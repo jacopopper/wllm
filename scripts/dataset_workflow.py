@@ -182,6 +182,8 @@ def run_adapter(trace, **options):
     """Run a research adapter on a loaded trace envelope.
 
     Replace with your own adapter (RAUQ, EigenScore, ActMap, or custom).
+    The generic helpers in research.features make common UQ patterns easy
+    (chosen_logprobs, last_token_hidden, etc.).
     """
     from research.token_baselines import TokenBaselineAdapter
 
@@ -294,6 +296,18 @@ def main() -> int:
             try:
                 adapter_result = run_adapter(trace)
                 result = build_result(entry, trace_response, trace, artifact_tensors, adapter_result)
+
+                # Example of using new generic helpers for UQ-style analysis
+                # (these work whether or not full logprobs/hidden were requested):
+                try:
+                    from research.features import chosen_logprobs, last_token_hidden
+                    clp = chosen_logprobs(trace)
+                    result["has_chosen_logprobs"] = bool(clp.get("generated"))
+                    # last hidden useful for probing / spectral methods
+                    # (loads from artifact if not inline)
+                    _ = last_token_hidden(trace)  # best effort
+                except Exception:
+                    pass
             except Exception as exc:
                 message = error_message(exc)
                 print(f"ADAPTER FAILED: {message}")
@@ -321,6 +335,23 @@ def main() -> int:
             fh.write("\n")
     print(f"Saved {len(results)} results to {output_path}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-sample helper (for EigenScore-style or Semantic Entropy workflows)
+#
+# Since extract endpoints enforce n=1, collect K traces for one prompt by
+# calling multiple times (vary seed or temperature). The generic helpers
+# above make it easy to stack last hiddens or chosen logprobs across samples.
+#
+# Example (not called automatically):
+#   traces = []
+#   for s in range(k):
+#       resp = extract_trace(client, prompt=..., model=..., max_tokens=..., seed=s)
+#       tr, arts = load_trace_and_artifacts(artifact_dir, resp)
+#       traces.append(tr)
+#   # then use last_token_hidden on each and np.stack, etc.
+# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

@@ -216,6 +216,7 @@ class ExtractionOrchestrator:
                 tokens=TokenTrace(
                     token_ids=token_ids if request.extract.tokens else [],
                     tokens=inputs.decoded_tokens if request.extract.tokens else [],
+                    chosen_logprobs=self._chosen_logprobs(inputs) if request.extract.tokens else [],
                 ),
                 spans={"prompt": (0, prompt_count), "generated": (prompt_count, len(token_ids))},
                 logprobs=self._inline_logprobs(request, inputs),
@@ -346,6 +347,31 @@ class ExtractionOrchestrator:
             if candidate.token_id == token_id:
                 return candidate
         return None
+
+    def _chosen_logprobs(self, inputs: GeneratedTraceInputs) -> list[float | None]:
+        """Return list of chosen (selected) token logprobs for prompt + generated.
+
+        Always attempts to return the logprob of the actually generated token
+        when the data is present in the vLLM output (populated when logprobs
+        were requested from the backend, which we force for extraction paths).
+        """
+        chosen: list[float | None] = []
+        # Prompt
+        for row in inputs.prompt_logprobs or []:
+            if row:
+                # The first or matching is the chosen for that position
+                chosen.append(row[0].logprob if row else None)
+            else:
+                chosen.append(None)
+        # Generated
+        for i, row in enumerate(inputs.generated_logprobs or []):
+            if row:
+                tid = inputs.generated_token_ids[i] if i < len(inputs.generated_token_ids) else None
+                sel = self._selected_logprob(row, tid)
+                chosen.append(sel.logprob if sel else (row[0].logprob if row else None))
+            else:
+                chosen.append(None)
+        return chosen
 
     def _write_requested_artifacts(
         self,

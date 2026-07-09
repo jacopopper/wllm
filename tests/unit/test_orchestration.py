@@ -162,6 +162,34 @@ def test_capture_timing_is_included_in_trace_metadata(tmp_path) -> None:
     assert trace.metadata.timing_ms.extraction_overhead >= 3.25
 
 
+def test_tokens_always_include_chosen_logprobs_in_extract(tmp_path) -> None:
+    """Chosen logprobs are populated for extract paths (first-class for UQ)."""
+    request = ExtractRequest.model_validate(
+        {"model": "fake", "prompt": "hello", "max_tokens": 2, "extract": {"tokens": True}}
+    )
+    inputs = replace(
+        make_inputs(),
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[12, 13],
+        prompt_logprobs=[[], [LogprobCandidate(11, -0.3)]],
+        generated_logprobs=[
+            [LogprobCandidate(12, -0.2)],
+            [LogprobCandidate(13, -0.1)],
+        ],
+    )
+    orchestrator = ExtractionOrchestrator(default_vllm_capabilities("fake", "fake"))
+    trace = orchestrator.build_trace(
+        request,
+        inputs,
+        limits=ResourceLimits(),
+        artifact_store=ArtifactStore(tmp_path),
+        persist=False,
+    )
+    assert trace.trace.tokens.chosen_logprobs
+    # 2 prompt + 2 generated (some may be None if not matched, but in this data present)
+    assert len(trace.trace.tokens.chosen_logprobs) == 4
+
+
 def test_hidden_state_position_error_includes_sequence_context(tmp_path) -> None:
     request = ExtractRequest.model_validate(
         {
