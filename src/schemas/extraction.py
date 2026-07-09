@@ -34,6 +34,9 @@ class HiddenStateExtraction(BaseModel):
     positions: PositionSelector
     pool: PoolOp = None
     capture_mode: HiddenStateCaptureMode = "replay"
+    # Richer capture sites for more detailed internal states (post-attn, post-mlp etc.)
+    # "block" (default, after full transformer block) is the transformer_block_output.
+    site: Literal["block", "post_attn", "post_mlp"] = "block"
 
 
 class AttentionExtraction(BaseModel):
@@ -133,6 +136,7 @@ def extraction_schema_payload(limits: ResourceLimits, capabilities: Any) -> Extr
             "previous_token": "for each selected query q, select key q - 1 when q > 0",
         },
         "pooling": [None, "mean", "max", "last"],
+        "hidden_capture_sites": ["block", "post_attn", "post_mlp"],
     }
     return ExtractionSchemaResponse(
         request_schema=ExtractRequest.model_json_schema(),

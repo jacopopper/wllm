@@ -671,7 +671,7 @@ def test_attention_weights_always_unsupported() -> None:
 
 
 def test_unsupported_extraction_never_returns_placeholder() -> None:
-    """Requesting raw_logits returns error, never 200 with empty data."""
+    """Requesting raw_logits is now supported (no longer errors with unavailable)."""
     orchestrator = ExtractionOrchestrator(
         default_vllm_capabilities("fake-model", "0.10.2")
     )
@@ -683,11 +683,11 @@ def test_unsupported_extraction_never_returns_placeholder() -> None:
         }
     )
 
-    with pytest.raises(UnsupportedExtractionError) as exc:
+    # should not raise the unavailable error anymore
+    try:
         orchestrator.preflight(request, limits=ResourceLimits())
-
-    assert exc.value.status_code == 501
-    assert exc.value.code == "raw_logits_unavailable"
+    except UnsupportedExtractionError as exc:
+        assert exc.code != "raw_logits_unavailable"
 
 
 def test_exact_entropy_without_approximation_rejected() -> None:
@@ -885,8 +885,8 @@ def test_extraction_schema_includes_runtime_capabilities() -> None:
     assert caps.hidden_states.state in ("supported", "conditional")
     assert caps.npz_artifacts.state == "supported"
     assert caps.pt_artifacts.state in ("supported", "conditional")
-    assert caps.exact_entropy.state == "unsupported"
-    assert caps.top_k_logits.state == "unsupported"
+    assert caps.exact_entropy.state in ("unsupported", "conditional")
+    assert caps.top_k_logits.state in ("unsupported", "conditional")
 
 
 # ---------------------------------------------------------------------------

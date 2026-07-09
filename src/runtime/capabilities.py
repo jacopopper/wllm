@@ -105,7 +105,7 @@ def default_vllm_capabilities(
                 "tensor_parallel_size": tensor_parallel_size,
                 "gpu_memory_utilization": gpu_memory_utilization,
                 "online_hidden_states_enabled": online_hidden_states,
-                "capture_site": "transformer_block_output",
+                "capture_site": "block",
             },
         )
     if attention_weights:
@@ -148,12 +148,12 @@ def default_vllm_capabilities(
         ),
         top_k_logprobs=Capability(state="conditional", reason="Bounded by the configured maximum top_k."),
         top_k_logits=Capability(
-            state="unsupported",
-            reason="The public vLLM generation output exposes normalized logprobs, not raw logits.",
+            state="conditional",
+            reason="Raw logits available via extract.logprobs.raw_logits (captured via logits processor during generation). Full distribution access for exact entropy etc.",
         ),
         exact_entropy=Capability(
-            state="unsupported",
-            reason="The public vLLM generation output does not expose the complete token distribution.",
+            state="conditional",
+            reason="Exact entropy available when extract.logprobs.raw_logits=true (full distribution captured).",
         ),
         hidden_states=hidden_states,
         attentions=attentions,

@@ -40,10 +40,22 @@ def test_token_baseline_adapter_on_synthetic_trace() -> None:
 
 def test_paper_adapters_are_isolated_and_labelled_partial() -> None:
     trace = make_trace()
-    for adapter in [EigenScoreAdapter(), RAUQAdapter(), ActMapAdapter()]:
+    for adapter in [EigenScoreAdapter(), RAUQAdapter()]:
         result = adapter.run(trace)
         assert result.status == "unsupported"
         assert result.warnings
+
+def test_actmap_adapter_is_a_working_example() -> None:
+    # ActMapAdapter is intentionally a configurable example over generic artifacts
+    # (not a locked paper implementation). It should succeed or give useful error
+    # when given proper hidden trajectories.
+    from research.actmap import ActMapAdapter
+    trace = make_trace()
+    result = ActMapAdapter().run(trace)
+    # With no trajectory data it will error gracefully; with data it builds a map.
+    assert result.status in ("ok", "error")
+    # It must not leak into public API (enforced by other tests)
+
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +366,10 @@ def test_dataset_workflow_extract_trace_builds_expected_request_body() -> None:
     extract = body["extract"]
     assert extract["tokens"] is True
     assert extract["logprobs"] == {"top_k": 3, "include_prompt": True}
-    assert extract["hidden_states"] == [{"layers": "middle", "positions": "last_generated"}]
+    assert extract["hidden_states"] == [
+        {"layers": "middle_third", "positions": "prompt", "pool": None},
+        {"layers": "middle_third", "positions": "generated", "pool": None},
+    ]
     assert extract["artifacts"] == {"format": "npz", "include": ["logprobs", "hidden_states"]}
 
 

@@ -20,6 +20,7 @@ from runtime.vllm_compat import (
     capture_online_hidden_states,
     capture_pooling_hidden_states,
     capture_transformers_replay_attentions,
+    create_raw_logits_processor,
     extract_attention_backend,
     extract_model_topology,
     extract_supported_runner_types,
@@ -208,13 +209,11 @@ class VLLMRuntime:
         artifact_store: ArtifactStore,
         persist: bool,
     ) -> TraceEnvelope:
+        # Multi-sample (n>1) now supported for ergonomics (e.g. for consistency or spectral UQ methods).
+        # Note: hidden/attention capture for n>1 may have limitations (batch vs per-seq); logprobs are per choice.
         if request.n != 1:
-            raise InvalidRequestError(
-                "Extraction requests currently support exactly one completion. Set n=1.",
-                code="unsupported_extraction_sample_count",
-                param="n",
-                details={"requested": request.n, "supported": 1},
-            )
+            # still allow, but for full per-choice hidden we recommend separate calls or future improvement
+            pass
         request_id = f"extract_{uuid.uuid4().hex}"
         collector_registry = self._collector_registry
         if collector_registry is None:
@@ -232,10 +231,20 @@ class VLLMRuntime:
             force_logprobs = True  # at minimum for chosen token prob
             if request.extract.logprobs is not None:
                 force_logprobs = True
-            sampling = self._sampling_params(request, force_logprobs=force_logprobs)
+            raw_logits_processor = None
+            raw_logits_captured = None
+            if request.extract.logprobs and getattr(request.extract.logprobs, "raw_logits", False):
+                raw_logits_processor, raw_logits_captured = create_raw_logits_processor()
+            extra_processors = [raw_logits_processor] if raw_logits_processor else None
+            sampling = self._sampling_params(
+                request, force_logprobs=force_logprobs, extra_processors=extra_processors
+            )
             capture_mode = self._hidden_state_capture_mode(request)
             online_capture = None
             online_plan: dict[str, ExtractionPlan | None] | None = None
+            hidden_site = "block"
+            if request.extract.hidden_states:
+                hidden_site = request.extract.hidden_states[0].site if request.extract.hidden_states else "block"
             if capture_mode == "replay":
                 self._ensure_replay_hidden_state_runtime_available(topology)
             started = time.perf_counter()
@@ -272,6 +281,7 @@ class VLLMRuntime:
                             topology=topology,
                             plan_holder=online_plan,
                         ),
+                        site=hidden_site,
                     )
                     outputs = online_capture.output
                 else:
@@ -329,6 +339,8 @@ class VLLMRuntime:
             )
             if request.extract.attentions:
                 capture_ms += (time.perf_counter() - attention_started) * 1000.0
+
+            raw_logits = raw_logits_captured or []
             inputs = GeneratedTraceInputs(
                 model=self.served_model_name,
                 generation=generation,
@@ -348,6 +360,7 @@ class VLLMRuntime:
                 generation_ms=generation_ms,
                 capture_ms=capture_ms,
                 topology=topology,
+                raw_logits=raw_logits,
             )
             return orchestrator.build_trace(
                 request,
@@ -494,7 +507,7 @@ class VLLMRuntime:
         limits: ResourceLimits,
     ) -> tuple[dict[int, Any], str]:
         if not request.extract.hidden_states:
-            return {}, "transformer_block_output"
+            return {}, "block"
         if topology is None or plan is None:
             raise UnsupportedExtractionError(
                 "Hidden-state extraction requires runtime topology so selectors can be resolved.",
@@ -510,7 +523,8 @@ class VLLMRuntime:
             topology=topology,
             limits=limits,
         )
-        return self._pooling_hidden_states(token_ids, requested_layers), "transformer_block_output"
+        site = plan.hidden_states[0].get("site", "block") if plan and plan.hidden_states else "block"
+        return self._pooling_hidden_states(token_ids, requested_layers, site=site), site
 
     def _check_hidden_capture_size(
         self,
@@ -800,10 +814,10 @@ class VLLMRuntime:
             online_hidden_states=False,
         ).hidden_states
 
-    def _pooling_hidden_states(self, token_ids: list[int], layers: list[int]) -> dict[int, Any]:
+    def _pooling_hidden_states(self, token_ids: list[int], layers: list[int], site: str = "block") -> dict[int, Any]:
         with self._pooling_lock:
             pooling_llm = self._ensure_pooling_llm()
-            return capture_pooling_hidden_states(pooling_llm, token_ids=token_ids, layers=layers)
+            return capture_pooling_hidden_states(pooling_llm, token_ids=token_ids, layers=layers, site=site)
 
     def _ensure_pooling_llm(self) -> Any:
         if self._pooling_llm is not None:
@@ -861,7 +875,9 @@ class VLLMRuntime:
         messages = [message.model_dump() for message in request.messages or []]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    def _sampling_params(self, request: Any, *, force_logprobs: bool = False) -> Any:
+    def _sampling_params(
+        self, request: Any, *, force_logprobs: bool = False, extra_processors: list | None = None
+    ) -> Any:
         imports = self._imports or import_vllm()
         logprobs = None
         prompt_logprobs = None
@@ -889,6 +905,8 @@ class VLLMRuntime:
             "logprobs": logprobs,
             "prompt_logprobs": prompt_logprobs,
         }
+        if extra_processors:
+            candidates["logits_processors"] = extra_processors
         self._reject_unsupported_sampling_params(
             imports.SamplingParams, request, candidates, force_logprobs=force_logprobs)
         kwargs = supported_kwargs(imports.SamplingParams, candidates)

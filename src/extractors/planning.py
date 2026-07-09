@@ -150,7 +150,13 @@ def _compile(
                 limits=limits,
                 reason="Full hidden-state dumps must be artifact-backed and explicitly enabled.",
             )
-        item = {"layers": layers, "positions": positions, "pool": hidden.pool, "capture_mode": hidden.capture_mode}
+        item = {
+            "layers": layers,
+            "positions": positions,
+            "pool": hidden.pool,
+            "capture_mode": hidden.capture_mode,
+            "site": getattr(hidden, "site", "block"),
+        }
         hidden_metadata.append(item)
         plan.hidden_states.append(item)
 

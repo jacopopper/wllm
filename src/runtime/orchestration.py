@@ -43,11 +43,12 @@ class GeneratedTraceInputs:
     generated_logprobs: list[list[LogprobCandidate]] = field(default_factory=list)
     hidden_states: dict[int, Any] = field(default_factory=dict)
     preselected_hidden_states: dict[str, Any] = field(default_factory=dict)
-    hidden_state_capture_site: str = "transformer_block_output"
+    hidden_state_capture_site: str = "block"
     hidden_state_capture_mode: str = "replay"
     hidden_state_capture_phase: str = "replay"
     hidden_state_capture_metadata: dict[str, Any] = field(default_factory=dict)
     attentions: dict[int, Any] = field(default_factory=dict)
+    raw_logits: list = field(default_factory=list)  # full vocab logits per generated step (if raw_logits requested)
     attention_capture_site: str = "attention_weights"
     attention_capture_mode: str = "replay"
     attention_capture_phase: str = "replay"
@@ -111,15 +112,15 @@ class ExtractionOrchestrator:
             )
         if topology is not None:
             validate_pre_generation_selectors(spec, topology=topology, limits=limits)
-        if spec.logprobs and spec.logprobs.raw_logits:
+        # raw_logits now supported via logits processor capture (see vllm_compat and runtime)
+        if (
+            spec.logprobs
+            and spec.logprobs.entropy
+            and not spec.logprobs.allow_approximate_entropy
+            and not (spec.logprobs.raw_logits)
+        ):
             raise UnsupportedExtractionError(
-                "Raw logits are not exposed by the public vLLM generation output.",
-                code="raw_logits_unavailable",
-                param="extract.logprobs.raw_logits",
-            )
-        if spec.logprobs and spec.logprobs.entropy and not spec.logprobs.allow_approximate_entropy:
-            raise UnsupportedExtractionError(
-                "Exact entropy requires the complete token distribution, which the active runtime does not expose.",
+                "Exact entropy requires raw_logits=true (or allow_approximate_entropy).",
                 code="exact_entropy_unavailable",
                 param="extract.logprobs.entropy",
             )
@@ -405,6 +406,8 @@ class ExtractionOrchestrator:
                 prompt_token_ids, prompt_logprobs = self._logprob_arrays(inputs, top_k=top_k, prompt=True)
                 tensors["prompt_logprob_token_ids"] = prompt_token_ids
                 tensors["prompt_logprobs"] = prompt_logprobs
+            if inputs.raw_logits:
+                tensors["raw_logits"] = [np.asarray(t, dtype=np.float32) for t in inputs.raw_logits]
         if "hidden_states" in include:
             for hidden in hidden_tensors:
                 tensors[hidden.name] = hidden.tensor

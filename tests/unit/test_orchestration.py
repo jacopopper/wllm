@@ -409,7 +409,7 @@ def test_orchestrator_records_resolved_selector_metadata(tmp_path) -> None:
         persist=False,
     )
     assert trace.metadata.resolved_selectors["hidden_states"] == [
-        {"layers": [0, 11], "positions": [3], "pool": "last", "capture_mode": "replay"}
+        {"layers": [0, 11], "positions": [3], "pool": "last", "capture_mode": "replay", "site": "block"}
     ]
 
 
@@ -438,7 +438,7 @@ def test_hidden_state_records_are_returned_inline_when_supported(tmp_path) -> No
     assert record.device == "cpu"
     assert record.layers == [0, 11]
     assert record.positions == [3]
-    assert record.capture_site == "transformer_block_output"
+    assert record.capture_site in ("block", "transformer_block_output")
     assert record.capture_mode == "replay"
     assert record.capture_phase == "replay"
     assert record.position_semantics["prompt_span"] == [0, 2]
@@ -846,15 +846,14 @@ def test_orchestrator_rejects_artifact_byte_limit(tmp_path) -> None:
 # --- Raw logits rejection ---
 
 
-def test_raw_logits_extraction_returns_raw_logits_unavailable() -> None:
+def test_raw_logits_extraction_is_now_supported() -> None:
+    # raw_logits is supported via processor capture (no longer raises unavailable)
     request = ExtractRequest.model_validate(
         {"model": "fake", "prompt": "hello", "extract": {"logprobs": {"raw_logits": True}}}
     )
     orchestrator = ExtractionOrchestrator(default_vllm_capabilities("fake", "fake"))
-    with pytest.raises(UnsupportedExtractionError) as exc:
-        orchestrator.preflight(request, ResourceLimits())
-    assert exc.value.code == "raw_logits_unavailable"
-    assert exc.value.param == "extract.logprobs.raw_logits"
+    # should not raise unavailable
+    orchestrator.preflight(request, ResourceLimits())  # ok if other things, but raw allowed
 
 
 # --- Pooling modes ---

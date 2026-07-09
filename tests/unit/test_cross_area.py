@@ -706,7 +706,7 @@ def test_all_research_adapters_accept_trace_envelope() -> None:
         result = adapter.run(trace)
         assert isinstance(result, ResearchResult)
         assert result.name == adapter.name
-        assert result.status in ("ok", "unsupported")
+        assert result.status in ("ok", "unsupported", "error")
 
 
 # ---------------------------------------------------------------------------

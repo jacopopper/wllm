@@ -611,11 +611,41 @@ def capture_transformers_replay_attentions(
     return captures
 
 
+# ---------------------------------------------------------------------------
+# Raw logits capture via logits processor (for exact entropy, margins, etc.)
+# ---------------------------------------------------------------------------
+
+def create_raw_logits_processor() -> tuple[callable, list]:
+    """Return a logits processor + list that will receive full raw logits tensors.
+
+    The processor is suitable for SamplingParams.logits_processors.
+    Each call (one per generated token) appends a CPU clone of the full
+    (vocab_size,) logits tensor for that position.
+
+    This gives access to the un-normalized logits that vLLM used for sampling,
+    enabling exact entropy and other full-distribution UQ methods.
+    """
+    captured: list = []
+
+    def _raw_logits_processor(
+        past_token_ids: list[int], logits: "torch.Tensor"
+    ) -> "torch.Tensor":
+        # logits is (vocab_size,) or (batch, vocab) depending on context
+        # For n=1 it is usually 1D per step in the way processors are called.
+        if hasattr(logits, "dim") and logits.dim() > 1:
+            logits = logits[0]
+        captured.append(logits.detach().cpu().clone())
+        return logits
+
+    return _raw_logits_processor, captured
+
+
 def capture_pooling_hidden_states(
     pooling_llm: Any,
     *,
     token_ids: list[int],
     layers: list[int],
+    site: str = "block",
 ) -> dict[int, Any]:
     """Capture selected transformer block outputs from an isolated pooling LLM.
 
@@ -641,7 +671,7 @@ def capture_pooling_hidden_states(
     try:
         install_results = _apply_model_to_workers(
             pooling_llm,
-            lambda model: _install_hidden_state_hooks(model, unique_layers),
+            lambda model: _install_hidden_state_hooks(model, unique_layers, site=site),
         )
     except Exception as exc:
         raise UnsupportedExtractionError(
@@ -720,6 +750,7 @@ def capture_online_hidden_states(
     generate: Any,
     capture_max_position: int | None = None,
     select_hidden_states: Any | None = None,
+    site: str = "block",
 ) -> OnlineHiddenStateCapture:
     """Capture transformer block outputs from the active generation LLM.
 
@@ -744,6 +775,7 @@ def capture_online_hidden_states(
                 unique_layers,
                 capture_max_position=capture_max_position,
                 copy_to_cpu=copy_to_cpu,
+                site=site,
             ),
         )
     except Exception as exc:
@@ -854,7 +886,7 @@ def capture_online_hidden_states(
     return OnlineHiddenStateCapture(
         output=output,
         tensors=captures,
-        capture_site="transformer_block_output",
+        capture_site="block",
         capture_phase="prompt_prefill_decode_best_effort",
         metadata={
             "hook_scope": "active_generation_runner",
@@ -1005,6 +1037,7 @@ def _install_hidden_state_hooks(
     *,
     capture_max_position: int | None = None,
     copy_to_cpu: bool = True,
+    site: str = "block",
 ) -> dict[str, Any]:
     """Install forward hooks on selected transformer-block layers.
 
@@ -1047,10 +1080,12 @@ def _install_hidden_state_hooks(
         "copy_to_cpu": copy_to_cpu,
     }
     setattr(model, "_wllm_hidden_state_capture", state)
-    for layer in layers:
-        module = modules[layer]
+    for layer_idx in layers:
+        layer_mod = modules[layer_idx]
+        target = _get_layer_target_module(layer_mod, site)
+        module = target if target is not None else layer_mod
 
-        def hook(_module: Any, _inputs: tuple[Any, ...], output: Any, *, layer_index: int = layer) -> None:
+        def hook(_module: Any, _inputs: tuple[Any, ...], output: Any, *, layer_index: int = layer_idx) -> None:
             tensor = _first_tensor(output)
             if tensor is not None:
                 offset = int(state["offsets"].get(layer_index, 0))
@@ -1066,6 +1101,7 @@ def _install_hidden_state_hooks(
         "installed_layers": layers,
         "num_layers": len(modules),
         "capture_filter": _capture_filter_metadata(capture_max_position),
+        "site": site,
     }
 
 
@@ -1166,6 +1202,35 @@ def _locate_layer_modules(model: Any) -> Any | None:
         if modules is not None and hasattr(modules, "__len__") and hasattr(modules, "__getitem__"):
             return modules
     return None
+
+
+def _get_layer_target_module(layer: Any, site: str = "block") -> Any | None:
+    """Return the appropriate submodule inside a transformer layer for the capture site.
+
+    Supports:
+      - "block": the full layer (default, post residual)
+      - "post_attn": the attention submodule output
+      - "post_mlp": the MLP/FFN submodule output
+
+    This enables richer hidden-state capture for probing and analysis methods.
+    """
+    if site == "block" or not site:
+        return layer
+
+    # Common attribute names across architectures (Llama, Mistral, Qwen, etc.)
+    if site == "post_attn":
+        for name in ("self_attn", "attn", "attention", "self_attention"):
+            mod = getattr(layer, name, None)
+            if mod is not None:
+                return mod
+    elif site == "post_mlp":
+        for name in ("mlp", "feed_forward", "ffn", "mlp_block"):
+            mod = getattr(layer, name, None)
+            if mod is not None:
+                return mod
+
+    # Fallback to the full layer
+    return layer
 
 
 def _first_tensor(value: Any) -> Any | None:

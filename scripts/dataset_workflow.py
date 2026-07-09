@@ -116,7 +116,13 @@ def extract_trace(
         artifacts_include.append("logprobs")
 
     if include_hidden_states:
-        extract["hidden_states"] = [{"layers": "middle", "positions": "last_generated"}]
+        # For ActMap-like activation maps: capture full per-token trajectories
+        # for both prefill (prompt) and decoding (generated). Use pool=null for
+        # per-position vectors; load via artifacts for large trajectories.
+        extract["hidden_states"] = [
+            {"layers": "middle_third", "positions": "prompt", "pool": None},      # prefill
+            {"layers": "middle_third", "positions": "generated", "pool": None},  # decoding
+        ]
         artifacts_include.append("hidden_states")
 
     if artifacts_include:
@@ -346,11 +352,15 @@ def main() -> int:
 #
 # Example (not called automatically):
 #   traces = []
+#   arts_list = []
 #   for s in range(k):
 #       resp = extract_trace(client, prompt=..., model=..., max_tokens=..., seed=s)
 #       tr, arts = load_trace_and_artifacts(artifact_dir, resp)
 #       traces.append(tr)
-#   # then use last_token_hidden on each and np.stack, etc.
+#       arts_list.append(arts)
+#   from research.features import stack_features_across_samples
+#   hiddens = stack_features_across_samples(traces, feature="last_hidden", prefer_artifact_tensors_list=arts_list)
+#   # hiddens.shape == (k, dim) ready for EigenScore etc.
 # ---------------------------------------------------------------------------
 
 

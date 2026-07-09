@@ -24,22 +24,31 @@ benchmarking/tmp/
 benchmarking/**/artifacts/
 benchmarking/**/__pycache__/
 
-# Markdown planning/release notes stay local; the root README is the only
-# Markdown document included in the release source.
-*.md
+# Planning and local notes (do not ship these with the open library)
+first-version-safety-researcher-library-plan.md
+*plan.md
+*TODO*.md
+*scratch*.md
+
+# Curated documentation that *should* ship
+# (everything else .md is treated as local by default above)
+# Root README and selected benchmarking study docs are allowed via negation below
 !/README.md
-# Allow curated benchmarking analysis (similar to selected reports/)
 !/benchmarking/README.md
 !/benchmarking/gaps_and_recommendations.md
+!/benchmarking/vllm_transparency_sketches.md
 !/benchmarking/methods/*/README.md
+!/CHANGELOG.md  # already versioned, but explicit in case
 
-# Build outputs
+# Build outputs and packaging (never commit built artifacts)
 dist/
 build/
 *.egg-info/
 *.egg
 *.whl
-uv.lock
+*.tar.gz
+sdist/
+uv.lock  # lockfile for the library itself; consumers manage their own
 
 # Python cache
 __pycache__/
@@ -63,3 +72,57 @@ env/
 
 # OS
 .DS_Store
+
+# Environment and secrets (never commit these)
+.env
+.env.*
+.env.local
+*.log
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# Coverage reports and testing artifacts
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Type checkers and linters
+.pyre/
+.pytype/
+.mypy_cache/
+.ruff_cache/
+.pylint.d/
+
+# Cython / compiled debug
+cython_debug/
+
+# Local large data and model files (do not ship with the library)
+*.npz
+*.pt
+*.bin
+*.safetensors
+local_models/
+hf_cache/
+models--*/
+cache/
+
+# Additional user-generated wllm runtime data
+wllm-*-artifacts/
+artifacts/
+
+# Temporary files from examples or local runs
+tmp/
+temp/
+*.tmp
+*.temp

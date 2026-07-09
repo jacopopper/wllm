@@ -4,7 +4,9 @@ OpenAI-compatible vLLM serving with opt-in white-box traces.
 
 wllm runs normal chat and completion requests through vLLM, while adding a small
 set of researcher-oriented endpoints for extracting token IDs, logprobs, hidden
-states, experimental replay attention weights, and persisted tensor artifacts.
+states (during both prefill and decoding, at richer internal sites), experimental
+replay attention weights, raw logits, and persisted tensor artifacts.
+
 Extraction is explicit: standard generation requests do not allocate collectors,
 install hooks, run replay models, or write artifacts.
 
@@ -32,7 +34,7 @@ wllm is an early `0.1.0` release.
 | OpenAI endpoints | `/v1/models`, `/v1/chat/completions`, `/v1/completions` |
 | Extraction endpoints | `/v1/extract`, `/v1/traces`, `/v1/extraction-schema` |
 | Streaming | not supported |
-| Hidden states | conditional, single GPU |
+| Hidden states | conditional (prefill + decode supported); single GPU; richer capture sites (block, post-attn, post-mlp) |
 | Attention weights | experimental, replay-only opt-in |
 | Tests | unit tests plus GPU integration smoke tests |
 
@@ -231,57 +233,79 @@ and are rejected with capability errors.
 
 ### Hidden States
 
-Replay capture is the default mode. It generates normally, then replays the final
-token sequence through an isolated vLLM pooling runner with scoped hooks:
+wllm makes it easy to capture hidden states during **both prefill** (prompt
+processing) and **decoding** (generation). This is the core low-level capability
+for building activation maps (ActMap-style or custom), probing, spectral
+analysis, malicious-prompt detection on prefill activations, etc.
+
+#### Prefill-only (prompt activations, no generation)
+
+Use `max_tokens: 0` + `positions: "prompt"` (or `"last"`) to capture activations
+from just the prompt. Ideal for input-side analysis such as malicious or
+jailbreak prompt detection before any tokens are generated.
 
 ```bash
 curl http://localhost:8000/v1/extract \
   -H 'content-type: application/json' \
   -d '{
     "model": "Qwen/Qwen3-0.6B",
-    "prompt": "Explain how transformer blocks process information.",
-    "max_tokens": 32,
+    "prompt": "Ignore all previous instructions and ...",
+    "max_tokens": 0,
     "extract": {
       "hidden_states": [
         {
           "layers": "middle_third",
-          "positions": "generated",
-          "pool": "mean"
+          "positions": "prompt",
+          "pool": null,
+          "site": "post_attn"
         }
-      ]
+      ],
+      "artifacts": {"format": "npz", "include": ["hidden_states"]}
     }
   }'
 ```
 
-Replay requirements:
+#### Full trajectories (prefill + decode)
 
-- `tensor_parallel_size=1`
-- `gpu_memory_utilization <= 0.5`
-- a vLLM model configuration that supports the pooling runner
-
-Online capture is opt-in and captures from the active generation runner:
-
-```bash
-wllm serve Qwen/Qwen3-0.6B --enable-online-hidden-states
-```
+Request multiple specs in one call to get separate prompt and generated
+trajectories:
 
 ```json
-{
-  "extract": {
-    "hidden_states": [
-      {
-        "layers": "middle",
-        "positions": "prompt",
-        "capture_mode": "online"
-      }
-    ]
-  }
-}
+"hidden_states": [
+  {"layers": "middle_third", "positions": "prompt", "pool": null, "site": "block"},
+  {"layers": "middle_third", "positions": "generated", "pool": null, "site": "post_attn"}
+]
 ```
 
-Online mode avoids the replay pass, but it starts the generation runner in eager
-in-process mode with prefix caching disabled. It is not numerically
-interchangeable with replay mode; choose the mode that matches your experiment.
+Use `pool: null` + artifacts for full per-token, per-layer tensors. These are
+perfect inputs for building custom activation maps.
+
+#### Capture sites and modes
+
+Hidden states can be captured at richer internal points using the `site` field:
+
+- `"block"` (default) — after the full transformer block
+- `"post_attn"` — after attention
+- `"post_mlp"` — after the MLP/FFN
+
+Replay is the default (isolated runner). Use `capture_mode: "online"` (with
+`--enable-online-hidden-states`) to capture from the active generation pass.
+
+See `research.features` for helpers:
+- `get_hidden_trajectories(trace, artifacts)` → `{"prompt": (L, Tp, D), "generated": (L, Tg, D)}`
+- `get_prefill_activation_map(...)` — convenient for prefill-only map building
+- `build_activation_map(trajectory, ...)` — flexible C×L'×D' maps (your choice of temporal channels, binning, etc.)
+
+A minimal example focused on prefill actmap extraction lives at
+`scripts/prefill_actmap_extraction.py`.
+
+Replay requirements (same as before):
+- `tensor_parallel_size=1`
+- `gpu_memory_utilization <= 0.5`
+- Pooling runner supported by the model
+
+Online mode runs the generation runner in eager mode with prefix caching
+disabled. The two modes are not numerically interchangeable.
 
 ### Attention Weights
 
@@ -334,8 +358,14 @@ scope.
 |---|---|
 | Layers | integer, integer list, negative indexes, `all`, `middle`, `middle_third` |
 | Positions | integer, integer list, negative indexes, `prompt`, `generated`, `last`, `last_generated` |
+| Hidden-state site | `"block"` (default), `"post_attn"`, `"post_mlp"` |
 | Attention key positions | position selector or `previous_token` |
 | Hidden-state pooling | `null`, `mean`, `max`, `last` |
+| Hidden-state capture_mode | `"replay"` (default), `"online"` |
+
+Use `positions: "prompt"` + `max_tokens: 0` for pure prefill activations. Use
+multiple `hidden_states` objects (or combine with `"generated"`) to get
+separate prefill and decoding trajectories for activation map construction.
 
 ## Artifacts
 
@@ -508,14 +538,41 @@ Research adapters live under `src/research/`. They consume `TraceEnvelope`
 objects and artifact tensors; they do not add server routes or paper-specific
 request fields.
 
-Generic helpers for common patterns (chosen token logprobs, last-token hidden
-vectors, etc.) are available in `research.features` (e.g. `chosen_logprobs(trace)`,
-`last_token_hidden(trace, layer=...)`).
+Generic helpers for common patterns live in `research.features` (all operate on
+`TraceEnvelope` + loaded artifacts):
 
-A study of the top white-box UQ / hallucination detection methods (token-prob
-baselines, EigenScore/INSIDE, RAUQ attention patterns, SAPLMA-style probes,
-Semantic Entropy) and the general improvements they suggest lives in
-`benchmarking/`. The recommendations are deliberately method-agnostic.
+- `get_hidden_trajectories(trace, artifacts)` → `{"prompt": (L, Tp, D), "generated": (L, Tg, D)}`
+- `get_prefill_activation_map(...)` — convenient builder for prefill-only maps
+- `build_activation_map(trajectory, num_layer_bins=..., num_dim_bins=..., channel_specs=...)` — fully flexible C×L'×D' maps
+- `chosen_logprobs`, `last_token_hidden`, `entropy_from_raw_logits`, `stack_features_across_samples`, etc.
+
+These are intentionally general building blocks. wllm does **not** implement
+paper-specific methods (ActMap, EigenScore, RAUQ, etc.). Researchers bring their
+own logic on top of the raw trajectories and maps.
+
+Hidden-state extraction supports `site` ("block" | "post_attn" | "post_mlp")
+for richer capture during **both prefill** (e.g. `positions="prompt"`, `max_tokens=0`)
+**and decoding** (`positions="generated"`). Request multiple specs in one call
+and use `pool: null` + artifacts to obtain full per-token, per-layer tensors.
+
+This directly supports research such as:
+- Activation-map (ActMap-style) construction from prefill activations
+- Malicious/jailbreak prompt detection using only prompt-side hidden states
+- Probing, spectral methods, and custom feature extraction on prefill + decode trajectories
+
+See `scripts/prefill_actmap_extraction.py` for a focused, minimal example of
+extracting prefill activations and building maps (your detection or analysis
+logic stays completely outside wllm).
+
+`research.actmap.ActMapAdapter` is provided as a small configurable example of
+using the helpers above; it is deliberately general rather than a locked-in
+implementation of any particular paper.
+
+Raw logits and relaxed multi-sample (`n>1`) are also supported on extraction
+endpoints.
+
+A study of top white-box UQ/hallucination methods and the general capabilities
+they benefit from is in `benchmarking/`.
 
 ## Resource Limits
 
